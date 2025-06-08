@@ -1,6 +1,8 @@
 import pygame
 from config import settings
 from graphics.renderer import Renderer
+from core.biome_generator import BiomeGenerator # Import BiomeGenerator
+
 
 def main():
     pygame.init()
@@ -9,11 +11,13 @@ def main():
     pygame.display.set_caption("2D Building Simulator")
     clock = pygame.time.Clock()
 
-    renderer = Renderer(screen)
-
+    # Instantiate BiomeGenerator
+    biome_generator = BiomeGenerator(settings.SCREEN_WIDTH, settings.SCREEN_HEIGHT)
+    # Pass biome_generator to Renderer
+    renderer = Renderer(screen, biome_generator)
     # --- Game State ---
     # You can change this to test different biomes
-    current_biome = "BWh" # Example: Hot Desert
+    current_biome = "Dfc" # Example: Hot Desert
     # current_biome = "Af"  # Example: Tropical Rainforest
     # current_biome = "ET"  # Example: Tundra
 
