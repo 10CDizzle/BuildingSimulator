@@ -114,3 +114,19 @@ class BiomeGenerator:
         """
         return list(BIOME_DATA.keys())
 
+    def get_ground_y_at_x(self, x_coord, biome_code):
+        """
+        Calculates the y-coordinate of the ground at a specific x-coordinate
+        based on the biome's terrain generation parameters.
+        :param x_coord: The x-coordinate on the screen.
+        :param biome_code: The Koppen code for the biome.
+        :return: The y-coordinate of the ground.
+        """
+        props = self.get_biome_properties(biome_code)
+        base_ground_y = self.screen_height * props["base_height_factor"]
+        amplitude = props["amplitude"]
+        frequency = props["frequency"]
+        phase_shift = props.get("phase_shift", 0.0)
+
+        y_offset = amplitude * math.sin(frequency * x_coord + phase_shift)
+        return min(self.screen_height -1, max(0, base_ground_y + y_offset))
