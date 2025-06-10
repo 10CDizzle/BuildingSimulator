@@ -18,6 +18,88 @@ class Cloud:
             offset_y = random.randint(-int(height*0.2), int(height*0.2))
             self.puffs.append((pygame.Rect(0,0, puff_w, puff_h), offset_x, offset_y))
 
+class BuildingFragment:
+    def __init__(self, initial_points_m, color, velocity_x_mps, velocity_y_mps, angular_velocity_rad_s):
+        # initial_points_m: list of (x,y) tuples in meters, defining the polygon relative to world origin
+        self.points_m = [list(p) for p in initial_points_m] # Make points mutable
+        self.center_m = self._calculate_centroid(self.points_m)
+        
+        # Translate points to be relative to the centroid for rotation
+        for p in self.points_m:
+            p[0] -= self.center_m[0]
+            p[1] -= self.center_m[1]
+
+        self.color = color
+        self.pos_m = list(self.center_m) # Current position of the centroid in meters
+        self.velocity_x_mps = velocity_x_mps
+        self.velocity_y_mps = velocity_y_mps
+        self.angle_rad = 0.0
+        self.angular_velocity_rad_s = angular_velocity_rad_s
+        self.gravity_mps2 = 9.81
+        self.is_settled = False
+        self.min_y_for_settle = float('inf') # Track lowest point for settling
+
+    def _calculate_centroid(self, points):
+        x_coords = [p[0] for p in points]
+        y_coords = [p[1] for p in points]
+        return sum(x_coords) / len(points), sum(y_coords) / len(points)
+
+    def update(self, delta_time, ground_y_at_x_func_pixels, biome_code):
+        if self.is_settled:
+            return
+
+        self.velocity_y_mps += self.gravity_mps2 * delta_time
+        self.pos_m[0] += self.velocity_x_mps * delta_time
+        self.pos_m[1] += self.velocity_y_mps * delta_time
+        self.angle_rad += self.angular_velocity_rad_s * delta_time
+
+        # Basic ground collision and settling
+        # Check the lowest point of the rotated fragment
+        world_points_pixels = self.get_world_points_pixels()
+        if not world_points_pixels: return # Should not happen if points exist
+
+        current_min_y_pixels = min(p[1] for p in world_points_pixels)
+        fragment_bottom_center_x_pixels = self.pos_m[0] * settings.METERS_TO_PIXELS # Approx.
+
+        ground_level_pixels = ground_y_at_x_func_pixels(fragment_bottom_center_x_pixels, biome_code)
+
+        if self.pos_m[1] * settings.METERS_TO_PIXELS > ground_level_pixels - 5: # If centroid is near/below ground
+            # More robust check: if any point is below ground
+            deepest_penetration = 0
+            for _, py_pixel in world_points_pixels:
+                 if py_pixel > ground_level_pixels:
+                    deepest_penetration = max(deepest_penetration, py_pixel - ground_level_pixels)
+            
+            if deepest_penetration > 0:
+                self.pos_m[1] -= deepest_penetration / settings.METERS_TO_PIXELS # Move fragment up
+                self.velocity_y_mps *= -0.1 # Greatly reduce bounce
+                self.velocity_x_mps *= 0.5  # Increase friction
+                self.angular_velocity_rad_s *= 0.3 # Increase rotational friction
+
+                if abs(self.velocity_y_mps) < 0.2 and abs(self.angular_velocity_rad_s) < 0.05: # Stricter settling condition
+                    self.is_settled = True
+                    self.velocity_y_mps = 0
+                    self.velocity_x_mps = 0
+                    self.angular_velocity_rad_s = 0
+
+    def get_world_points_pixels(self):
+        rotated_points_m = []
+        for rel_x_m, rel_y_m in self.points_m:
+            # Rotate point
+            rotated_x = rel_x_m * math.cos(self.angle_rad) - rel_y_m * math.sin(self.angle_rad)
+            rotated_y = rel_x_m * math.sin(self.angle_rad) + rel_y_m * math.cos(self.angle_rad)
+            # Translate to world position (centroid)
+            world_x_m = rotated_x + self.pos_m[0]
+            world_y_m = rotated_y + self.pos_m[1]
+            rotated_points_m.append((world_x_m * settings.METERS_TO_PIXELS, world_y_m * settings.METERS_TO_PIXELS))
+        return rotated_points_m
+
+    def draw(self, surface):
+        world_points_pixels = self.get_world_points_pixels()
+        if len(world_points_pixels) >= 3:
+            pygame.draw.polygon(surface, self.color, world_points_pixels)
+            pygame.draw.polygon(surface, settings.BLACK, world_points_pixels, 1) # Outline
+
 class Renderer:
     def __init__(self, screen, biome_generator):
         """
@@ -28,7 +110,7 @@ class Renderer:
         self.screen = screen
         self.biome_generator = biome_generator
 
-    def render_world(self, current_biome_code="Af", building_to_draw=None, building_x_position=None, clouds=None):
+    def render_world(self, current_biome_code="Af", building_to_draw=None, building_x_position=None, clouds=None, active_fragments=None, destruction_animation_playing=False):
         """
         Renders the game world based on the current biome.
         For a side view, this means a sky and a curvy ground.
@@ -36,6 +118,8 @@ class Renderer:
         :param building_to_draw: Optional Building object to render.
         :param building_x_position: Optional x-coordinate for the center of the building.
         :param clouds: Optional list of Cloud objects to render.
+        :param active_fragments: Optional list of BuildingFragment objects.
+        :param destruction_animation_playing: Boolean indicating if destruction animation is active.
         """
         biome_props = self.biome_generator.get_biome_properties(current_biome_code)
         sky_color = biome_props["sky"]
@@ -49,8 +133,15 @@ class Renderer:
         if clouds:
             self.render_clouds(clouds)
 
-        if building_to_draw and building_x_position is not None:
-            self.render_building(building_to_draw, building_x_position, current_biome_code)
+        if building_to_draw:
+            if building_to_draw.is_destroyed:
+                if destruction_animation_playing and active_fragments: # Render fragments during animation
+                    self.render_fragments(active_fragments)
+                elif not destruction_animation_playing: # Animation done, show static rubble
+                    self.render_static_rubble_pile(building_to_draw, building_x_position, current_biome_code)
+            else: # Building not destroyed
+                if building_x_position is not None:
+                    self.render_building(building_to_draw, building_x_position, current_biome_code)
 
     def render_clouds(self, clouds):
         """Renders a list of Cloud objects."""
@@ -70,9 +161,13 @@ class Renderer:
         :param x_center_screen: The screen x-coordinate for the center of the building.
         :param biome_code: The current biome code to determine ground height.
         """
-        if building.is_destroyed:
-            self.render_destroyed_building(building, x_center_screen, biome_code)
-            return
+        # This check is now handled in render_world to allow for animation
+        # if building.is_destroyed:
+        #     self.render_static_rubble_pile(building, x_center_screen, biome_code)
+        #     return
+
+        # Building dimensions in pixels
+        building_width_pixels = building.footprint_length * settings.METERS_TO_PIXELS
 
         # Building dimensions in pixels
         building_width_pixels = building.footprint_length * settings.METERS_TO_PIXELS
@@ -139,10 +234,15 @@ class Renderer:
                 pygame.draw.rect(self.screen, settings.WINDOW_COLOR, window_rect)
                 pygame.draw.rect(self.screen, settings.BLACK, window_rect, 1) # Window outline
 
-    def render_destroyed_building(self, building, x_center_screen, biome_code):
+    def render_fragments(self, fragments):
+        """Renders active building fragments."""
+        for fragment in fragments:
+            fragment.draw(self.screen)
+
+    def render_static_rubble_pile(self, building, x_center_screen, biome_code):
         """Renders a simple representation of a destroyed building."""
-        rubble_width_pixels = building.footprint_length * settings.METERS_TO_PIXELS * 1.2 # Slightly wider
-        rubble_height_pixels = building.total_height * settings.METERS_TO_PIXELS * 0.2 # Much shorter
+        rubble_width_pixels = building.footprint_length * settings.METERS_TO_PIXELS * 1.2
+        rubble_height_pixels = building.total_height * settings.METERS_TO_PIXELS * 0.2
 
         building_x_left = x_center_screen - rubble_width_pixels / 2
         building_x_right = x_center_screen + rubble_width_pixels / 2

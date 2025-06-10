@@ -1,5 +1,8 @@
 from enum import Enum, auto
 import math
+import random
+from graphics.renderer import BuildingFragment
+
 
 class Material:
     """Represents material properties for building components."""
@@ -205,3 +208,70 @@ class Building:
             self.is_destroyed = True
             self.angular_velocity_rad_per_s = 0 # Stop further motion
             self.angular_displacement_rad = math.copysign(self.max_safe_angular_displacement_rad, self.angular_displacement_rad) # Settle at max angle
+
+    def generate_fragments(self, base_x_m, building_base_y_m, initial_lean_angle_rad):
+        """
+        Generates BuildingFragment objects when the building is destroyed.
+        :param base_x_m: The x-coordinate of the building's base center in meters.
+        :param building_base_y_m: The y-coordinate of the building's base in meters (ground level).
+        :param initial_lean_angle_rad: The building's lean angle at collapse.
+        :return: A list of BuildingFragment objects.
+        """
+        fragments = []
+        num_fragments_per_story_width = 2 # How many pieces to break each story into horizontally
+        fragment_width_m = self.footprint_length / num_fragments_per_story_width
+        fragment_height_m = self.story_height
+
+        # Color for fragments (could be based on material)
+        gray_val = random.randint(100, 180) if hasattr(self.primary_material, 'color') else 120 # Placeholder
+        fragment_color = (gray_val, gray_val, gray_val)
+
+        for story_n in range(self.num_stories):
+            story_bottom_y_m = building_base_y_m - ((story_n + 1) * self.story_height) # Y is screen coords
+            story_top_y_m = building_base_y_m - (story_n * self.story_height)
+
+            for i in range(num_fragments_per_story_width):
+                frag_base_x_offset_m = (i - num_fragments_per_story_width / 2 + 0.5) * fragment_width_m
+                
+                # Initial center of the fragment before building lean
+                center_x_m = base_x_m + frag_base_x_offset_m
+                center_y_m = story_bottom_y_m + fragment_height_m / 2
+
+                # Apply building's overall lean to the fragment's initial position (simplified)
+                # Fragment's height from base for lean calculation
+                height_from_base_for_lean = (story_n + 0.5) * self.story_height
+                lean_dx_m = height_from_base_for_lean * math.tan(initial_lean_angle_rad)
+                center_x_m += lean_dx_m
+
+                # Define rectangle points for the fragment (in world meters, around its own center_x_m, center_y_m)
+                hw, hh = fragment_width_m / 2, fragment_height_m / 2
+                cx, cy = center_x_m, center_y_m
+
+                # Max perturbation as a fraction of half-dimensions
+                perturb_scale_w = 0.3 * hw
+                perturb_scale_h = 0.3 * hh
+
+                def r_offset(scale):
+                    return random.uniform(-scale, scale)
+
+                # Define 8 points for a jagged polygon, in order (e.g., clockwise)
+                # Top-left, top-mid, top-right, right-mid, bottom-right, bottom-mid, bottom-left, left-mid
+                points_m = [
+                    (cx - hw + r_offset(perturb_scale_w), cy - hh + r_offset(perturb_scale_h)), # Top-left
+                    (cx       + r_offset(perturb_scale_w), cy - hh + r_offset(perturb_scale_h)), # Top-mid
+                    (cx + hw + r_offset(perturb_scale_w), cy - hh + r_offset(perturb_scale_h)), # Top-right
+                    (cx + hw + r_offset(perturb_scale_w), cy       + r_offset(perturb_scale_h)), # Right-mid
+                    (cx + hw + r_offset(perturb_scale_w), cy + hh + r_offset(perturb_scale_h)), # Bottom-right
+                    (cx       + r_offset(perturb_scale_w), cy + hh + r_offset(perturb_scale_h)), # Bottom-mid
+                    (cx - hw + r_offset(perturb_scale_w), cy + hh + r_offset(perturb_scale_h)), # Bottom-left
+                    (cx - hw + r_offset(perturb_scale_w), cy       + r_offset(perturb_scale_h))  # Left-mid
+                ]
+
+
+                # Initial velocities - make them explode outwards and upwards a bit
+                vel_x_mps = random.uniform(-4, 4) + (lean_dx_m * 0.3) # Add some lean influence, increased spread
+                vel_y_mps = random.uniform(-5, 1) - (story_n * 0.5) # Higher stories get more upward kick
+                angular_vel_rad_s = random.uniform(-math.pi/2, math.pi/2)
+
+                fragments.append(BuildingFragment(points_m, fragment_color, vel_x_mps, vel_y_mps, angular_vel_rad_s))
+        return fragments

@@ -2,9 +2,8 @@ import pygame
 import random
 import math # Import the math module
 from config import settings
-from graphics.renderer import Renderer, Cloud # Import Cloud
-from core.biome_generator import BiomeGenerator
-from core.building_structure import Building, CONCRETE, Material, StructuralSystemType # Import more for reset
+from graphics.renderer import Renderer, Cloud, BuildingFragment # Import BuildingFragment
+from core.biome_generator import BiomeGenerator # Import BiomeGenerator
 from core.building_structure import Building, CONCRETE # Import Building and an example material
 import pygame_gui
 
@@ -77,7 +76,7 @@ def main():
             primary_material=CONCRETE, # Or allow selection later
             rotational_stiffness_nm_per_rad=8e7, # Default, could be UI controlled
             rotational_damping_nm_s_per_rad=5e6,   # Default, could be UI controlled
-            max_safe_angular_displacement_rad=settings.DEFAULT_MAX_SAFE_ANGLE_RAD if hasattr(settings, "DEFAULT_MAX_SAFE_ANGLE_RAD") else math.radians(20) # Example
+            max_safe_angular_displacement_rad=settings.DEFAULT_MAX_SAFE_ANGLE_RAD
         )
 
     sample_building = create_new_building()
@@ -106,8 +105,10 @@ def main():
     # --- Game State ---
     current_biome = "Dfc" # Example: Hot Desert
     game_over_prompt_active = False
+    destruction_animation_playing = False
+    active_fragments = [] # Changed from active_debris
+    destruction_animation_timer = 0.0
     confirmation_dialog = None
-
 
     running = True
     while running:
@@ -123,7 +124,7 @@ def main():
         
             ui_manager.process_events(event) # Pass events to pygame_gui
 
-            if not game_over_prompt_active:
+            if not game_over_prompt_active and not destruction_animation_playing:
                 # Handle UI events only if not waiting for restart choice
                 if event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
                     parameter_changed = False
@@ -174,7 +175,7 @@ def main():
 
 
         # --- Game Logic Updates (conditionally) ---
-        if not game_over_prompt_active:
+        if not game_over_prompt_active and not destruction_animation_playing:
             # Update Clouds
             for cloud in clouds:
                 cloud.rect.x += cloud.speed
@@ -184,26 +185,48 @@ def main():
                 elif cloud.speed < 0 and cloud.rect.right < 0:
                     cloud.rect.left = settings.SCREEN_WIDTH
                     cloud.rect.y = random.randint(20, settings.SCREEN_HEIGHT // 3)
-
             # Update Building Physics
             sample_building.update_physics(time_delta)
 
             # Check for destruction and show prompt
-            if sample_building.is_destroyed and not game_over_prompt_active:
-                game_over_prompt_active = True
-                confirmation_dialog = pygame_gui.windows.UIConfirmationDialog(
-                    rect=pygame.Rect((settings.SCREEN_WIDTH // 2 - 150, settings.SCREEN_HEIGHT // 2 - 100), (300, 200)),
-                    manager=ui_manager,
-                    window_title="Building Destroyed!",
-                    action_long_desc="The building has collapsed. Would you like to restart?",
-                    action_short_name="Restart",
-                    blocking=True # Makes it modal
-                )
+            if sample_building.is_destroyed and not destruction_animation_playing:
+                print("Building destruction triggered! Starting animation.")
+                destruction_animation_playing = True
+                # Generate fragments using the building's method
+                destruction_animation_timer = 0.0 # Reset timer
+                base_x_m = building_base_screen_x_center / settings.METERS_TO_PIXELS
+                ground_y_pixels_at_base = biome_generator.get_ground_y_at_x(building_base_screen_x_center, current_biome)
+                building_base_y_m = ground_y_pixels_at_base / settings.METERS_TO_PIXELS
+                active_fragments = sample_building.generate_fragments(base_x_m, building_base_y_m, sample_building.angular_displacement_rad)
+        
+        if destruction_animation_playing:
+            # Update fragments
+            destruction_animation_timer += time_delta
+            all_settled = True
+            for fragment in active_fragments:
+                fragment.update(time_delta, biome_generator.get_ground_y_at_x, current_biome)
+                if not fragment.is_settled:
+                    all_settled = False
+            
+            # End animation if all fragments settled OR timer exceeds 5 seconds
+            if (all_settled and active_fragments) or destruction_animation_timer > 5.0:
+                print(f"Destruction animation ended. Reason: {'All settled' if all_settled else 'Timer expired'}.")
+                destruction_animation_playing = False
+                game_over_prompt_active = True 
+                if not confirmation_dialog: # Ensure dialog is not already up
+                    confirmation_dialog = pygame_gui.windows.UIConfirmationDialog(
+                        rect=pygame.Rect((settings.SCREEN_WIDTH // 2 - 150, settings.SCREEN_HEIGHT // 2 - 100), (300, 200)),
+                        manager=ui_manager,
+                        window_title="Building Destroyed!",
+                        action_long_desc="The building has collapsed. Would you like to restart?",
+                        action_short_name="Restart",
+                        blocking=True 
+                    )
 
         ui_manager.update(time_delta)
 
         # --- Rendering ---
-        renderer.render_world(current_biome, sample_building, building_base_screen_x_center, clouds)
+        renderer.render_world(current_biome, sample_building, building_base_screen_x_center, clouds, active_fragments, destruction_animation_playing)
         ui_manager.draw_ui(screen) # Draw pygame_gui elements
 
         pygame.display.flip()
@@ -212,4 +235,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-                    
