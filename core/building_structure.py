@@ -86,7 +86,8 @@ class Building:
                  retrofitting_measures: list = None, # List of strings or enums describing retrofits
                  # Rotational Physics properties
                  rotational_stiffness_nm_per_rad: float = 5e7, # Nm/rad, arbitrary
-                 rotational_damping_nm_s_per_rad: float = 1e6  # Nms/rad, arbitrary
+                 rotational_damping_nm_s_per_rad: float = 1e6,  # Nms/rad, arbitrary
+                 max_safe_angular_displacement_rad: float = math.radians(20) # e.g., 20 degrees
                  ):
 
         # Structural Parameters
@@ -130,6 +131,8 @@ class Building:
         if self.calculated_mass <= 0:
             self.calculated_mass = 1000 # Default small mass if calculation fails
 
+        self.is_destroyed: bool = False
+
         self.angular_displacement_rad: float = 0.0       # Current sway angle
         self.angular_velocity_rad_per_s: float = 0.0     # Current angular velocity
         self.accumulated_torque_nm: float = 0.0          # Torque accumulated in a frame
@@ -137,6 +140,7 @@ class Building:
         self.rotational_damping_nm_s_per_rad = rotational_damping_nm_s_per_rad
         # Moment of inertia (approx. as thin rod rotating about base: 1/3 * m * h^2)
         self.moment_of_inertia_kg_m2: float = (1/3) * self.calculated_mass * (self.total_height**2) if self.total_height > 0 else 1e6
+        self.max_safe_angular_displacement_rad = max_safe_angular_displacement_rad
 
         self.calculated_natural_period: float = self._calculate_natural_period()
 
@@ -183,7 +187,8 @@ class Building:
         Models as a rotational spring-damper system using Euler integration.
         :param delta_time: Time elapsed since the last update (seconds).
         """
-        if self.moment_of_inertia_kg_m2 <= 0: return # Safety check
+        if self.is_destroyed or self.moment_of_inertia_kg_m2 <= 0:
+            return # No physics updates if destroyed or invalid inertia
 
         restoring_torque = -self.rotational_stiffness_nm_per_rad * self.angular_displacement_rad
         damping_torque = -self.rotational_damping_nm_s_per_rad * self.angular_velocity_rad_per_s
@@ -194,3 +199,9 @@ class Building:
         self.angular_velocity_rad_per_s += angular_acceleration * delta_time
         self.angular_displacement_rad += self.angular_velocity_rad_per_s * delta_time
         self.accumulated_torque_nm = 0.0 # Reset torque for the next frame
+
+        # Check for destruction
+        if abs(self.angular_displacement_rad) > self.max_safe_angular_displacement_rad:
+            self.is_destroyed = True
+            self.angular_velocity_rad_per_s = 0 # Stop further motion
+            self.angular_displacement_rad = math.copysign(self.max_safe_angular_displacement_rad, self.angular_displacement_rad) # Settle at max angle

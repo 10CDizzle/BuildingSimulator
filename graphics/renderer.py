@@ -70,6 +70,10 @@ class Renderer:
         :param x_center_screen: The screen x-coordinate for the center of the building.
         :param biome_code: The current biome code to determine ground height.
         """
+        if building.is_destroyed:
+            self.render_destroyed_building(building, x_center_screen, biome_code)
+            return
+
         # Building dimensions in pixels
         building_width_pixels = building.footprint_length * settings.METERS_TO_PIXELS
         building_height_pixels = building.total_height * settings.METERS_TO_PIXELS
@@ -134,3 +138,26 @@ class Renderer:
                 window_rect = pygame.Rect(sheared_win_center_x - window_width / 2, win_top_y, window_width, window_height)
                 pygame.draw.rect(self.screen, settings.WINDOW_COLOR, window_rect)
                 pygame.draw.rect(self.screen, settings.BLACK, window_rect, 1) # Window outline
+
+    def render_destroyed_building(self, building, x_center_screen, biome_code):
+        """Renders a simple representation of a destroyed building."""
+        rubble_width_pixels = building.footprint_length * settings.METERS_TO_PIXELS * 1.2 # Slightly wider
+        rubble_height_pixels = building.total_height * settings.METERS_TO_PIXELS * 0.2 # Much shorter
+
+        building_x_left = x_center_screen - rubble_width_pixels / 2
+        building_x_right = x_center_screen + rubble_width_pixels / 2
+
+        ground_y_left = self.biome_generator.get_ground_y_at_x(building_x_left, biome_code)
+        ground_y_right = self.biome_generator.get_ground_y_at_x(building_x_right, biome_code)
+        
+        # Simple rubble pile as a polygon
+        points = [
+            (building_x_left, ground_y_left),
+            (building_x_right, ground_y_right),
+            (x_center_screen + rubble_width_pixels * 0.2, ground_y_right - rubble_height_pixels * 0.7),
+            (x_center_screen, ground_y_left - rubble_height_pixels), # Peak of rubble
+            (x_center_screen - rubble_width_pixels * 0.2, ground_y_left - rubble_height_pixels * 0.6),
+        ]
+        pygame.draw.polygon(self.screen, settings.GRAY, points)
+        pygame.draw.polygon(self.screen, settings.BLACK, points, 2)
+        # Could add "DESTROYED" text here too

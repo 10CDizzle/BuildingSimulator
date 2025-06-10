@@ -1,8 +1,10 @@
 import pygame
 import random
+import math # Import the math module
 from config import settings
 from graphics.renderer import Renderer, Cloud # Import Cloud
 from core.biome_generator import BiomeGenerator
+from core.building_structure import Building, CONCRETE, Material, StructuralSystemType # Import more for reset
 from core.building_structure import Building, CONCRETE # Import Building and an example material
 import pygame_gui
 
@@ -32,6 +34,7 @@ def main():
     initial_story_h = 3.0
     initial_length = 15.0
     initial_width = 10.0
+    initial_wind_speed = 25.0 # m/s
 
     # --- Create UI Elements ---
     # Stories Slider
@@ -47,10 +50,14 @@ def main():
     pygame_gui.elements.UILabel(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 1 - ui_margin - label_height), (label_width, label_height)), text="Width (m):", manager=ui_manager)
     width_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 1 - ui_margin), (slider_width, slider_height)), start_value=initial_width, value_range=(5.0, 50.0), manager=ui_manager, object_id="#width_slider")
 
+    # Wind Speed Slider (placing it next to the button or above it)
+    pygame_gui.elements.UILabel(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 2 - ui_margin - label_height), (label_width, label_height)), text="Wind Speed (m/s):", manager=ui_manager)
+    wind_speed_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 2 - ui_margin), (slider_width, slider_height)), start_value=initial_wind_speed, value_range=(0.0, 6000.0), manager=ui_manager, object_id="#wind_speed_slider")
+
     # Event Button
     button_width = 150
     button_height = 40
-    simulate_wind_button = pygame_gui.elements.UIButton(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - button_width - ui_margin, settings.SCREEN_HEIGHT - button_height - ui_margin), (button_width, button_height)), text='Simulate Wind', manager=ui_manager, object_id="#wind_button")
+    simulate_wind_button = pygame_gui.elements.UIButton(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - button_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 1 - ui_margin), (button_width, button_height)), text='Simulate Wind', manager=ui_manager, object_id="#wind_button")
 
     # Store sliders for easy access if needed, or use object_ids
     sliders = {
@@ -60,19 +67,22 @@ def main():
         "width": width_slider
     }
 
-    # --- Create a sample building ---
-    sample_building = Building(
-        num_stories=initial_stories,
-        story_height=initial_story_h,
-        footprint_length=initial_length, # meters
-        footprint_width=initial_width,  # meters
-        primary_material=CONCRETE,
-        # Adjust these values to get desired sway behavior
-        rotational_stiffness_nm_per_rad=8e7, # Higher stiffness
-        rotational_damping_nm_s_per_rad=5e6   # Moderate damping
-    )
-    building_base_screen_x_center = settings.SCREEN_WIDTH // 2 # Base position of the building
+    # --- Function to create/reset the building ---
+    def create_new_building():
+        return Building(
+            num_stories=int(stories_slider.get_current_value()),
+            story_height=round(story_h_slider.get_current_value(), 1),
+            footprint_length=round(length_slider.get_current_value(), 1),
+            footprint_width=round(width_slider.get_current_value(), 1),
+            primary_material=CONCRETE, # Or allow selection later
+            rotational_stiffness_nm_per_rad=8e7, # Default, could be UI controlled
+            rotational_damping_nm_s_per_rad=5e6,   # Default, could be UI controlled
+            max_safe_angular_displacement_rad=settings.DEFAULT_MAX_SAFE_ANGLE_RAD if hasattr(settings, "DEFAULT_MAX_SAFE_ANGLE_RAD") else math.radians(20) # Example
+        )
 
+    sample_building = create_new_building()
+    building_base_screen_x_center = settings.SCREEN_WIDTH // 2 # Base position of the building
+    
     # --- Cloud Management ---
     clouds = []
     MAX_CLOUDS = 7
@@ -95,6 +105,9 @@ def main():
 
     # --- Game State ---
     current_biome = "Dfc" # Example: Hot Desert
+    game_over_prompt_active = False
+    confirmation_dialog = None
+
 
     running = True
     while running:
@@ -110,58 +123,82 @@ def main():
         
             ui_manager.process_events(event) # Pass events to pygame_gui
 
-            # Handle UI events
-            if event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
-                parameter_changed = False
-                if event.ui_element == stories_slider:
-                    sample_building.num_stories = int(event.value)
-                    parameter_changed = True
-                elif event.ui_element == story_h_slider:
-                    sample_building.story_height = round(event.value, 1)
-                    parameter_changed = True
-                elif event.ui_element == length_slider:
-                    sample_building.footprint_length = round(event.value, 1)
-                    parameter_changed = True
-                elif event.ui_element == width_slider:
-                    sample_building.footprint_width = round(event.value, 1)
-                    parameter_changed = True
-                
-                if parameter_changed: # Recalculate derived properties and mass
-                    sample_building.total_height = sample_building.num_stories * sample_building.story_height
-                    sample_building.aspect_ratio_l = sample_building.total_height / sample_building.footprint_length if sample_building.footprint_length > 0 else float('inf')
-                    sample_building.aspect_ratio_w = sample_building.total_height / sample_building.footprint_width if sample_building.footprint_width > 0 else float('inf')
-                    sample_building.calculated_mass = sample_building._calculate_total_mass() # Recalculate mass
-                    if sample_building.calculated_mass <= 0: sample_building.calculated_mass = 1000 # Safety
-                    # Recalculate moment of inertia as mass and height might have changed
-                    sample_building.moment_of_inertia_kg_m2 = (1/3) * sample_building.calculated_mass * (sample_building.total_height**2) if sample_building.total_height > 0 else 1e6
-
-            if event.type == pygame_gui.UI_BUTTON_PRESSED:
-                if event.ui_element == simulate_wind_button:
-                    wind_speed_mps = random.uniform(15.0, 40.0) # Simulate wind speed (m/s)
-                    print(f"Simulating wind at {wind_speed_mps:.1f} m/s")
+            if not game_over_prompt_active:
+                # Handle UI events only if not waiting for restart choice
+                if event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
+                    parameter_changed = False
+                    if event.ui_element == stories_slider:
+                        sample_building.num_stories = int(event.value)
+                        parameter_changed = True
+                    elif event.ui_element == story_h_slider:
+                        sample_building.story_height = round(event.value, 1)
+                        parameter_changed = True
+                    elif event.ui_element == length_slider:
+                        sample_building.footprint_length = round(event.value, 1)
+                        parameter_changed = True
+                    elif event.ui_element == width_slider:
+                        sample_building.footprint_width = round(event.value, 1)
+                        parameter_changed = True
                     
-                    # Calculate wind force: F = 0.5 * rho * v^2 * A * Cd
-                    # Exposed area (simplified as frontal area: height * width)
-                    # For a 2D side view, we use footprint_length as the "width" exposed to wind.
-                    exposed_area = sample_building.total_height * sample_building.footprint_length 
-                    wind_force_newtons = 0.5 * settings.AIR_DENSITY * (wind_speed_mps**2) * exposed_area * settings.DEFAULT_DRAG_COEFFICIENT
-                    
-                    # Apply force at mid-height of the building
-                    sample_building.apply_horizontal_force(wind_force_newtons, sample_building.total_height / 2)
+                    if parameter_changed and not sample_building.is_destroyed: # Recalculate derived properties and mass
+                        sample_building.total_height = sample_building.num_stories * sample_building.story_height
+                        sample_building.aspect_ratio_l = sample_building.total_height / sample_building.footprint_length if sample_building.footprint_length > 0 else float('inf')
+                        sample_building.aspect_ratio_w = sample_building.total_height / sample_building.footprint_width if sample_building.footprint_width > 0 else float('inf')
+                        sample_building.calculated_mass = sample_building._calculate_total_mass() # Recalculate mass
+                        if sample_building.calculated_mass <= 0: sample_building.calculated_mass = 1000 # Safety
+                        sample_building.moment_of_inertia_kg_m2 = (1/3) * sample_building.calculated_mass * (sample_building.total_height**2) if sample_building.total_height > 0 else 1e6
 
-        # --- Game Logic - Update Clouds ---
-        for cloud in clouds:
-            cloud.rect.x += cloud.speed
-            # If cloud moves off screen, reset it
-            if cloud.speed > 0 and cloud.rect.left > settings.SCREEN_WIDTH:
-                cloud.rect.right = 0
-                cloud.rect.y = random.randint(20, settings.SCREEN_HEIGHT // 3)
-            elif cloud.speed < 0 and cloud.rect.right < 0:
-                cloud.rect.left = settings.SCREEN_WIDTH
-                cloud.rect.y = random.randint(20, settings.SCREEN_HEIGHT // 3)
+                if event.type == pygame_gui.UI_BUTTON_PRESSED:
+                    if event.ui_element == simulate_wind_button and not sample_building.is_destroyed:
+                        wind_speed_mps = wind_speed_slider.get_current_value()
+                        print(f"Simulating wind at {wind_speed_mps:.1f} m/s")
+                        exposed_area = sample_building.total_height * sample_building.footprint_length 
+                        wind_force_newtons = 0.5 * settings.AIR_DENSITY * (wind_speed_mps**2) * exposed_area * settings.DEFAULT_DRAG_COEFFICIENT
+                        sample_building.apply_horizontal_force(wind_force_newtons, sample_building.total_height / 2)
+            
+            # Handle confirmation dialog events
+            if event.type == pygame_gui.UI_CONFIRMATION_DIALOG_CONFIRMED:
+                if event.ui_element == confirmation_dialog:
+                    print("Restarting simulation...")
+                    sample_building = create_new_building() # Reset building
+                    game_over_prompt_active = False
+                    confirmation_dialog = None # Clear the reference
+            
+            if event.type == pygame.USEREVENT: # pygame_gui uses USEREVENT for various things
+                if event.user_type == pygame_gui.UI_WINDOW_CLOSE: # Check if it's our confirmation dialog
+                     if event.ui_element == confirmation_dialog:
+                        print("Exiting after destruction.")
+                        running = False # Or just keep game_over_prompt_active = True
+                        game_over_prompt_active = False # Allow exit
+                        confirmation_dialog = None
 
-        # --- Game Logic - Update Building Physics ---
-        sample_building.update_physics(time_delta)
+
+        # --- Game Logic Updates (conditionally) ---
+        if not game_over_prompt_active:
+            # Update Clouds
+            for cloud in clouds:
+                cloud.rect.x += cloud.speed
+                if cloud.speed > 0 and cloud.rect.left > settings.SCREEN_WIDTH:
+                    cloud.rect.right = 0
+                    cloud.rect.y = random.randint(20, settings.SCREEN_HEIGHT // 3)
+                elif cloud.speed < 0 and cloud.rect.right < 0:
+                    cloud.rect.left = settings.SCREEN_WIDTH
+                    cloud.rect.y = random.randint(20, settings.SCREEN_HEIGHT // 3)
+
+            # Update Building Physics
+            sample_building.update_physics(time_delta)
+
+            # Check for destruction and show prompt
+            if sample_building.is_destroyed and not game_over_prompt_active:
+                game_over_prompt_active = True
+                confirmation_dialog = pygame_gui.windows.UIConfirmationDialog(
+                    rect=pygame.Rect((settings.SCREEN_WIDTH // 2 - 150, settings.SCREEN_HEIGHT // 2 - 100), (300, 200)),
+                    manager=ui_manager,
+                    window_title="Building Destroyed!",
+                    action_long_desc="The building has collapsed. Would you like to restart?",
+                    action_short_name="Restart",
+                    blocking=True # Makes it modal
+                )
 
         ui_manager.update(time_delta)
 
@@ -171,9 +208,8 @@ def main():
 
         pygame.display.flip()
 
-        # clock.tick(settings.FPS) # time_delta is already handled by clock.tick
-
     pygame.quit()
 
 if __name__ == "__main__":
     main()
+                    
