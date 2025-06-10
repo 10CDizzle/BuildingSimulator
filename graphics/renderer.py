@@ -1,5 +1,6 @@
 import pygame
 import random
+import math
 from config import settings # For METERS_TO_PIXELS and colors
 
 class Cloud:
@@ -82,13 +83,19 @@ class Renderer:
         ground_y_left = self.biome_generator.get_ground_y_at_x(building_x_left, biome_code)
         ground_y_right = self.biome_generator.get_ground_y_at_x(building_x_right, biome_code)
 
+        # Calculate horizontal shear displacement at the top due to angular displacement
+        # Using tan for shear effect: dx = height * tan(angle)
+        # Cap angle to prevent extreme deformation and math errors with tan
+        max_angle_rad = math.radians(30) # Max 30 degrees lean
+        angle_rad = max(-max_angle_rad, min(max_angle_rad, building.angular_displacement_rad))
+        top_shear_dx = building_height_pixels * math.tan(angle_rad)
+
         # Define the four corner points of the building polygon
-        # Bottom-left, bottom-right, top-right, top-left
         points = [
-            (building_x_left, ground_y_left),
-            (building_x_right, ground_y_right),
-            (building_x_right, ground_y_right - building_height_pixels),
-            (building_x_left, ground_y_left - building_height_pixels),
+            (building_x_left, ground_y_left),                                       # Bottom-left
+            (building_x_right, ground_y_right),                                     # Bottom-right
+            (building_x_right + top_shear_dx, ground_y_right - building_height_pixels), # Top-right (sheared)
+            (building_x_left + top_shear_dx, ground_y_left - building_height_pixels),   # Top-left (sheared)
         ]
 
         pygame.draw.polygon(self.screen, settings.GRAY, points)
@@ -108,16 +115,22 @@ class Renderer:
             story_base_y_right = ground_y_right - (story_n * story_height_pixels)
 
             for i in range(num_windows_per_story_per_side):
-                # Interpolate x position for the window
-                # For simplicity, we'll place windows based on horizontal distance from left edge
+                # Original x position for the window center (relative to building's left edge)
                 win_x_offset = (i + 0.5) * (building_width_pixels / num_windows_per_story_per_side)
-                win_center_x = building_x_left + win_x_offset
+                original_win_center_x_on_facade = building_x_left + win_x_offset
 
-                # Interpolate y position for the window center on the sloped story
+                # Interpolate y position for the window's base on the potentially sloped story
                 slope_ratio = win_x_offset / building_width_pixels if building_width_pixels > 0 else 0
                 win_base_y = story_base_y_left * (1 - slope_ratio) + story_base_y_right * slope_ratio
                 win_top_y = win_base_y - story_height_pixels + window_margin_vertical
                 
-                window_rect = pygame.Rect(win_center_x - window_width / 2, win_top_y, window_width, window_height)
+                # Calculate shear displacement at the window's vertical center
+                # Height of window center from the building's base (approximate for sloped ground)
+                window_center_height_from_avg_base = (story_n + 0.5) * story_height_pixels
+                window_shear_dx = window_center_height_from_avg_base * math.tan(angle_rad)
+
+                sheared_win_center_x = original_win_center_x_on_facade + window_shear_dx
+                
+                window_rect = pygame.Rect(sheared_win_center_x - window_width / 2, win_top_y, window_width, window_height)
                 pygame.draw.rect(self.screen, settings.WINDOW_COLOR, window_rect)
                 pygame.draw.rect(self.screen, settings.BLACK, window_rect, 1) # Window outline

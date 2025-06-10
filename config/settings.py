@@ -16,3 +16,7 @@ WINDOW_COLOR = (173, 216, 230) # LightSkyBlue
 
 # --- Simulation Scale ---
 METERS_TO_PIXELS = 10  # 1 meter = 10 pixels
+
+# --- Physics Constants ---
+AIR_DENSITY = 1.225  # kg/m^3 (standard air density at sea level)
+DEFAULT_DRAG_COEFFICIENT = 1.2 # Typical for a rectangular building shape

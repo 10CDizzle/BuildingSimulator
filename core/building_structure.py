@@ -1,4 +1,5 @@
 from enum import Enum, auto
+import math
 
 class Material:
     """Represents material properties for building components."""
@@ -82,7 +83,10 @@ class Building:
                  ductility_level: float = 0.6,   # Normalized 0 (low) to 1 (high)
                  # Optional Realism Enhancers
                  has_non_structural_components: bool = True, # e.g., partition walls, ceilings
-                 retrofitting_measures: list = None # List of strings or enums describing retrofits
+                 retrofitting_measures: list = None, # List of strings or enums describing retrofits
+                 # Rotational Physics properties
+                 rotational_stiffness_nm_per_rad: float = 5e7, # Nm/rad, arbitrary
+                 rotational_damping_nm_s_per_rad: float = 1e6  # Nms/rad, arbitrary
                  ):
 
         # Structural Parameters
@@ -92,8 +96,8 @@ class Building:
 
         self.footprint_length = footprint_length
         self.footprint_width = footprint_width
-        self.aspect_ratio_l = self.total_height / footprint_length if footprint_length > 0 else float('inf')
-        self.aspect_ratio_w = self.total_height / footprint_width if footprint_width > 0 else float('inf')
+        self.aspect_ratio_l = self.total_height / self.footprint_length if self.footprint_length > 0 else float('inf')
+        self.aspect_ratio_w = self.total_height / self.footprint_width if self.footprint_width > 0 else float('inf')
 
         self.mass_distribution = mass_distribution
         self.primary_material = primary_material
@@ -120,8 +124,20 @@ class Building:
         self.has_non_structural_components = has_non_structural_components
         self.retrofitting_measures = retrofitting_measures if retrofitting_measures is not None else []
 
-        # Calculated properties (placeholders, to be implemented in physics/logic)
+        # --- Physics State ---
         self.calculated_mass: float = self._calculate_total_mass()
+        # Ensure mass is not zero to avoid division by zero errors
+        if self.calculated_mass <= 0:
+            self.calculated_mass = 1000 # Default small mass if calculation fails
+
+        self.angular_displacement_rad: float = 0.0       # Current sway angle
+        self.angular_velocity_rad_per_s: float = 0.0     # Current angular velocity
+        self.accumulated_torque_nm: float = 0.0          # Torque accumulated in a frame
+        self.rotational_stiffness_nm_per_rad = rotational_stiffness_nm_per_rad
+        self.rotational_damping_nm_s_per_rad = rotational_damping_nm_s_per_rad
+        # Moment of inertia (approx. as thin rod rotating about base: 1/3 * m * h^2)
+        self.moment_of_inertia_kg_m2: float = (1/3) * self.calculated_mass * (self.total_height**2) if self.total_height > 0 else 1e6
+
         self.calculated_natural_period: float = self._calculate_natural_period()
 
     def _calculate_total_mass(self) -> float:
@@ -130,7 +146,10 @@ class Building:
         mass = structural_volume * self.primary_material.density
         facade_area = 2 * (self.footprint_length + self.footprint_width) * self.total_height
         mass += facade_area * self.facade_cladding_mass_per_area
-        # Add floor mass, non-structural mass etc.
+        # Add floor mass (simplified: assume floors are 10% of story volume and same density)
+        floor_volume_per_story = self.footprint_length * self.footprint_width * self.story_height * 0.10
+        mass += floor_volume_per_story * self.primary_material.density * self.num_stories
+
         return mass
 
     def _calculate_natural_period(self) -> float:
@@ -144,3 +163,34 @@ class Building:
         return (f"Building: {self.num_stories} stories, {self.total_height:.1f}m H, "
                 f"{self.footprint_length:.1f}x{self.footprint_width:.1f}m Base, "
                 f"Mat: {self.primary_material}, Sys: {self.structural_system.name}")
+
+    def apply_horizontal_force(self, force_x: float, application_height_m: float = None):
+        """
+        Applies a horizontal force at a certain height, converting it to torque.
+        :param force_x: Force in the x-direction (Newtons).
+        :param application_height_m: Height from the base where the force is applied (meters).
+                                     Defaults to mid-height of the building.
+        """
+        if application_height_m is None:
+            application_height_m = self.total_height / 2
+        
+        torque = force_x * application_height_m
+        self.accumulated_torque_nm += torque
+
+    def update_physics(self, delta_time: float):
+        """
+        Updates the building's angular displacement and velocity based on applied torques.
+        Models as a rotational spring-damper system using Euler integration.
+        :param delta_time: Time elapsed since the last update (seconds).
+        """
+        if self.moment_of_inertia_kg_m2 <= 0: return # Safety check
+
+        restoring_torque = -self.rotational_stiffness_nm_per_rad * self.angular_displacement_rad
+        damping_torque = -self.rotational_damping_nm_s_per_rad * self.angular_velocity_rad_per_s
+        
+        net_torque = self.accumulated_torque_nm + restoring_torque + damping_torque
+        
+        angular_acceleration = net_torque / self.moment_of_inertia_kg_m2
+        self.angular_velocity_rad_per_s += angular_acceleration * delta_time
+        self.angular_displacement_rad += self.angular_velocity_rad_per_s * delta_time
+        self.accumulated_torque_nm = 0.0 # Reset torque for the next frame
