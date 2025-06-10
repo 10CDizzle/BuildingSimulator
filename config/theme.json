@@ -1,0 +1,10 @@
+{
+    "defaults": {
+        "colours": {
+            "normal_text": "#000000"
+        }
+    },
+    "label": {
+        "colours": {"normal_text": "#000000"}
+    }
+}

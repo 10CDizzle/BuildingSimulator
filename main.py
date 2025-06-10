@@ -4,7 +4,7 @@ from config import settings
 from graphics.renderer import Renderer, Cloud # Import Cloud
 from core.biome_generator import BiomeGenerator
 from core.building_structure import Building, CONCRETE # Import Building and an example material
-from ui.gui_manager import GUIManager # Import GUIManager
+import pygame_gui
 
 
 def main():
@@ -19,17 +19,41 @@ def main():
     # Pass biome_generator to Renderer
     renderer = Renderer(screen, biome_generator)
 
-    # --- UI Manager ---
-    gui_manager = GUIManager()
+    # --- Pygame GUI Manager ---
+    ui_manager = pygame_gui.UIManager((settings.SCREEN_WIDTH, settings.SCREEN_HEIGHT), 'config/theme.json')
     ui_margin = 20
-    scrollbar_height = 20
-    scrollbar_width = 200
-    # Add scrollbars for building parameters
-    # (param_name must match an attribute in the Building class)
-    gui_manager.add_scrollbar(ui_margin, settings.SCREEN_HEIGHT - scrollbar_height * 5 - ui_margin, scrollbar_width, scrollbar_height, 1, 20, 5, "Stories", "num_stories")
-    gui_manager.add_scrollbar(ui_margin, settings.SCREEN_HEIGHT - scrollbar_height * 4 - ui_margin, scrollbar_width, scrollbar_height, 2.0, 5.0, 3.0, "Story H (m)", "story_height")
-    gui_manager.add_scrollbar(ui_margin, settings.SCREEN_HEIGHT - scrollbar_height * 3 - ui_margin, scrollbar_width, scrollbar_height, 5.0, 50.0, 15.0, "Length (m)", "footprint_length")
-    gui_manager.add_scrollbar(ui_margin, settings.SCREEN_HEIGHT - scrollbar_height * 2 - ui_margin, scrollbar_width, scrollbar_height, 5.0, 50.0, 10.0, "Width (m)", "footprint_width")
+    slider_height = 30 # pygame_gui elements might have different preferred heights
+    slider_width = 220
+    label_height = 20
+    label_width = slider_width
+
+    # Initial building parameters
+    initial_stories = 5
+    initial_story_h = 3.0
+    initial_length = 15.0
+    initial_width = 10.0
+
+    # --- Create UI Elements ---
+    # Stories Slider
+    pygame_gui.elements.UILabel(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 4 - ui_margin - label_height), (label_width, label_height)), text="Stories:", manager=ui_manager)
+    stories_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 4 - ui_margin), (slider_width, slider_height)), start_value=initial_stories, value_range=(1, 20), manager=ui_manager, object_id="#stories_slider")
+    # Story Height Slider
+    pygame_gui.elements.UILabel(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 3 - ui_margin - label_height), (label_width, label_height)), text="Story Height (m):", manager=ui_manager)
+    story_h_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 3 - ui_margin), (slider_width, slider_height)), start_value=initial_story_h, value_range=(2.0, 5.0), manager=ui_manager, object_id="#story_h_slider")
+    # Footprint Length Slider
+    pygame_gui.elements.UILabel(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 2 - ui_margin - label_height), (label_width, label_height)), text="Length (m):", manager=ui_manager)
+    length_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 2 - ui_margin), (slider_width, slider_height)), start_value=initial_length, value_range=(5.0, 50.0), manager=ui_manager, object_id="#length_slider")
+    # Footprint Width Slider
+    pygame_gui.elements.UILabel(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 1 - ui_margin - label_height), (label_width, label_height)), text="Width (m):", manager=ui_manager)
+    width_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 1 - ui_margin), (slider_width, slider_height)), start_value=initial_width, value_range=(5.0, 50.0), manager=ui_manager, object_id="#width_slider")
+
+    # Store sliders for easy access if needed, or use object_ids
+    sliders = {
+        "stories": stories_slider,
+        "story_h": story_h_slider,
+        "length": length_slider,
+        "width": width_slider
+    }
 
     # --- Create a sample building ---
     sample_building = Building(
@@ -66,6 +90,7 @@ def main():
 
     running = True
     while running:
+        time_delta = clock.tick(settings.FPS) / 1000.0 # time_delta in seconds
         event_list = pygame.event.get()
         # --- Event Handling ---
         for event in event_list:
@@ -75,8 +100,27 @@ def main():
                 if event.key == pygame.K_ESCAPE:
                     running = False
         
-        gui_manager.handle_events(event_list)
+            ui_manager.process_events(event) # Pass events to pygame_gui
 
+            # Handle UI events (e.g., slider value changed)
+            if event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
+                rebuild = False
+                if event.ui_element == stories_slider:
+                    sample_building.num_stories = int(event.value)
+                    rebuild = True
+                elif event.ui_element == story_h_slider:
+                    sample_building.story_height = round(event.value, 1)
+                    rebuild = True
+                elif event.ui_element == length_slider:
+                    sample_building.footprint_length = round(event.value, 1)
+                    rebuild = True
+                elif event.ui_element == width_slider:
+                    sample_building.footprint_width = round(event.value, 1)
+                    rebuild = True
+                if rebuild: # Recalculate derived properties
+                    sample_building.total_height = sample_building.num_stories * sample_building.story_height
+                    sample_building.aspect_ratio_l = sample_building.total_height / sample_building.footprint_length if sample_building.footprint_length > 0 else float('inf')
+                    sample_building.aspect_ratio_w = sample_building.total_height / sample_building.footprint_width if sample_building.footprint_width > 0 else float('inf')
         # --- Game Logic - Update Clouds ---
         for cloud in clouds:
             cloud.rect.x += cloud.speed
@@ -88,17 +132,15 @@ def main():
                 cloud.rect.left = settings.SCREEN_WIDTH
                 cloud.rect.y = random.randint(20, settings.SCREEN_HEIGHT // 3)
 
-        # Update building parameters from UI
-        gui_manager.update_building_from_ui(sample_building)
-
+        ui_manager.update(time_delta)
 
         # --- Rendering ---
         renderer.render_world(current_biome, sample_building, building_screen_x_position, clouds)
-        gui_manager.draw_ui(screen) # Draw UI elements on top
+        ui_manager.draw_ui(screen) # Draw pygame_gui elements
+
         pygame.display.flip()
 
-        # --- Cap FPS ---
-        clock.tick(settings.FPS)
+        # clock.tick(settings.FPS) # time_delta is already handled by clock.tick
 
     pygame.quit()
 
