@@ -141,6 +141,7 @@ class Building:
         self.accumulated_torque_nm: float = 0.0          # Torque accumulated in a frame
         self.rotational_stiffness_nm_per_rad = rotational_stiffness_nm_per_rad
         self.rotational_damping_nm_s_per_rad = rotational_damping_nm_s_per_rad
+        self.original_rotational_stiffness = rotational_stiffness_nm_per_rad # Store for liquefaction
         # Moment of inertia (approx. as thin rod rotating about base: 1/3 * m * h^2)
         self.moment_of_inertia_kg_m2: float = (1/3) * self.calculated_mass * (self.total_height**2) if self.total_height > 0 else 1e6
         self.max_safe_angular_displacement_rad = max_safe_angular_displacement_rad
@@ -208,6 +209,18 @@ class Building:
             self.is_destroyed = True
             self.angular_velocity_rad_per_s = 0 # Stop further motion
             self.angular_displacement_rad = math.copysign(self.max_safe_angular_displacement_rad, self.angular_displacement_rad) # Settle at max angle
+
+    def set_stiffness_reduction_for_liquefaction(self, active: bool, reduction_factor: float = 0.3):
+        """
+        Reduces or restores rotational stiffness to simulate liquefaction.
+        :param active: If True, stiffness is reduced. If False, it's restored.
+        :param reduction_factor: The factor by which to reduce stiffness (e.g., 0.3 for 30% of original).
+        """
+        if active:
+            self.rotational_stiffness_nm_per_rad = self.original_rotational_stiffness * reduction_factor
+        else:
+            self.rotational_stiffness_nm_per_rad = self.original_rotational_stiffness
+
 
     def generate_fragments(self, base_x_m, building_base_y_m, initial_lean_angle_rad):
         """

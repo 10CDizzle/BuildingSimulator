@@ -54,9 +54,17 @@ def main():
     wind_speed_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 2 - ui_margin), (slider_width, slider_height)), start_value=initial_wind_speed, value_range=(0.0, 6000.0), manager=ui_manager, object_id="#wind_speed_slider")
 
     # Event Button
-    button_width = 150
+    action_button_width = 150
     button_height = 40
-    simulate_wind_button = pygame_gui.elements.UIButton(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - button_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 1 - ui_margin), (button_width, button_height)), text='Simulate Wind', manager=ui_manager, object_id="#wind_button")
+    simulate_wind_button = pygame_gui.elements.UIButton(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - action_button_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 1 - ui_margin), (action_button_width, button_height)), text='Simulate Wind', manager=ui_manager, object_id="#wind_button")
+
+    # Earthquake Intensity Slider
+    initial_earthquake_intensity = 0.2 # PGA in g (e.g., 0.2g)
+    pygame_gui.elements.UILabel(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 4 - ui_margin - label_height), (label_width, label_height)), text="Tremor Intensity (PGA g):", manager=ui_manager)
+    earthquake_intensity_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 4 - ui_margin), (slider_width, slider_height)), start_value=initial_earthquake_intensity, value_range=(0.0, 1.0), manager=ui_manager, object_id="#earthquake_intensity_slider")
+    # Earthquake Button
+    simulate_earthquake_button = pygame_gui.elements.UIButton(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - action_button_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 3 - ui_margin), (action_button_width, button_height)), text='Simulate Earthquake', manager=ui_manager, object_id="#earthquake_button")
+
 
     # Store sliders for easy access if needed, or use object_ids
     sliders = {
@@ -110,6 +118,14 @@ def main():
     destruction_animation_timer = 0.0
     confirmation_dialog = None
 
+    earthquake_active = False
+    earthquake_timer = 0.0
+    earthquake_duration = 3.0 # seconds
+    earthquake_current_intensity_g = 0.0
+    liquefaction_is_active_for_physics = False # For building stiffness reduction
+    liquefaction_threshold_g = 0.3 # PGA in g to trigger liquefaction
+    LIQUEFACTION_SWAY_FREQUENCY_HZ = 0.5 # How fast the ground sways during liquefaction
+
     running = True
     while running:
         time_delta = clock.tick(settings.FPS) / 1000.0 # time_delta in seconds
@@ -156,12 +172,27 @@ def main():
                         exposed_area = sample_building.total_height * sample_building.footprint_length 
                         wind_force_newtons = 0.5 * settings.AIR_DENSITY * (wind_speed_mps**2) * exposed_area * settings.DEFAULT_DRAG_COEFFICIENT
                         sample_building.apply_horizontal_force(wind_force_newtons, sample_building.total_height / 2)
+                    
+                    elif event.ui_element == simulate_earthquake_button and not sample_building.is_destroyed:
+                        if not earthquake_active: # Prevent re-triggering if already active
+                            earthquake_current_intensity_g = earthquake_intensity_slider.get_current_value()
+                            print(f"Simulating earthquake with PGA: {earthquake_current_intensity_g:.2f}g")
+                            earthquake_active = True
+                            earthquake_timer = 0.0
+                            if earthquake_current_intensity_g >= liquefaction_threshold_g:
+                                print("Liquefaction triggered!")
+                                liquefaction_is_active_for_physics = True
+                                sample_building.set_stiffness_reduction_for_liquefaction(True) # Reduce building stiffness
+                        else:
+                            print("Earthquake already in progress.")
+
             
             # Handle confirmation dialog events
             if event.type == pygame_gui.UI_CONFIRMATION_DIALOG_CONFIRMED:
                 if event.ui_element == confirmation_dialog:
                     print("Restarting simulation...")
                     sample_building = create_new_building() # Reset building
+                    liquefaction_is_active_for_physics = False # Ensure liquefaction physics off on restart
                     game_over_prompt_active = False
                     confirmation_dialog = None # Clear the reference
             
@@ -169,6 +200,7 @@ def main():
                 if event.user_type == pygame_gui.UI_WINDOW_CLOSE: # Check if it's our confirmation dialog
                      if event.ui_element == confirmation_dialog:
                         print("Exiting after destruction.")
+                        liquefaction_is_active_for_physics = False # Ensure liquefaction physics off on exit
                         running = False # Or just keep game_over_prompt_active = True
                         game_over_prompt_active = False # Allow exit
                         confirmation_dialog = None
@@ -188,6 +220,30 @@ def main():
             # Update Building Physics
             sample_building.update_physics(time_delta)
 
+            current_liquefaction_effect_scale = 0.0
+            # Apply earthquake forces if active
+            if earthquake_active:
+                earthquake_timer += time_delta
+                if earthquake_timer <= earthquake_duration:
+                    # Simple sinusoidal ground acceleration
+                    # Frequency of shaking (e.g., 2 Hz)
+                    shake_frequency_hz = 2.0
+                    ground_acceleration_mps2 = earthquake_current_intensity_g * 9.81 * math.sin(2 * math.pi * shake_frequency_hz * earthquake_timer)
+                    
+                    # Inertial force acts at CM (approx total_height / 2)
+                    inertial_force = -sample_building.calculated_mass * ground_acceleration_mps2
+                    sample_building.apply_horizontal_force(inertial_force, sample_building.total_height / 2)
+
+                    if liquefaction_is_active_for_physics: # Animate ground only if liquefaction is active
+                        # Scale oscillates between 0 and 1 for the visual effect
+                        current_liquefaction_effect_scale = (math.sin(2 * math.pi * LIQUEFACTION_SWAY_FREQUENCY_HZ * earthquake_timer) + 1.0) / 2.0
+                else:
+                    earthquake_active = False
+                    if liquefaction_is_active_for_physics:
+                        sample_building.set_stiffness_reduction_for_liquefaction(False) # Restore stiffness
+                        liquefaction_is_active_for_physics = False
+                    print("Earthquake finished.")
+
             # Check for destruction and show prompt
             if sample_building.is_destroyed and not destruction_animation_playing:
                 print("Building destruction triggered! Starting animation.")
@@ -195,7 +251,7 @@ def main():
                 # Generate fragments using the building's method
                 destruction_animation_timer = 0.0 # Reset timer
                 base_x_m = building_base_screen_x_center / settings.METERS_TO_PIXELS
-                ground_y_pixels_at_base = biome_generator.get_ground_y_at_x(building_base_screen_x_center, current_biome)
+                ground_y_pixels_at_base = biome_generator.get_ground_y_at_x(building_base_screen_x_center, current_biome, current_liquefaction_effect_scale) # Use current scale for fragment generation
                 building_base_y_m = ground_y_pixels_at_base / settings.METERS_TO_PIXELS
                 active_fragments = sample_building.generate_fragments(base_x_m, building_base_y_m, sample_building.angular_displacement_rad)
         
@@ -205,7 +261,7 @@ def main():
             all_settled = True
             for fragment in active_fragments:
                 fragment.update(time_delta, biome_generator.get_ground_y_at_x, current_biome)
-                if not fragment.is_settled:
+                if not fragment.is_settled: # Note: fragment.update doesn't currently take liquefaction_effect_scale for its ground check. Could be added.
                     all_settled = False
             
             # End animation if all fragments settled OR timer exceeds 5 seconds
@@ -226,7 +282,7 @@ def main():
         ui_manager.update(time_delta)
 
         # --- Rendering ---
-        renderer.render_world(current_biome, sample_building, building_base_screen_x_center, clouds, active_fragments, destruction_animation_playing)
+        renderer.render_world(current_biome, sample_building, building_base_screen_x_center, clouds, active_fragments, destruction_animation_playing, liquefaction_effect_scale=current_liquefaction_effect_scale)
         ui_manager.draw_ui(screen) # Draw pygame_gui elements
 
         pygame.display.flip()

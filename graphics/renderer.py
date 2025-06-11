@@ -109,8 +109,9 @@ class Renderer:
         """
         self.screen = screen
         self.biome_generator = biome_generator
+        # self.liquefaction_visuals_active = False # Replaced by liquefaction_effect_scale
 
-    def render_world(self, current_biome_code="Af", building_to_draw=None, building_x_position=None, clouds=None, active_fragments=None, destruction_animation_playing=False):
+    def render_world(self, current_biome_code="Af", building_to_draw=None, building_x_position=None, clouds=None, active_fragments=None, destruction_animation_playing=False, liquefaction_effect_scale=0.0):
         """
         Renders the game world based on the current biome.
         For a side view, this means a sky and a curvy ground.
@@ -120,14 +121,14 @@ class Renderer:
         :param clouds: Optional list of Cloud objects to render.
         :param active_fragments: Optional list of BuildingFragment objects.
         :param destruction_animation_playing: Boolean indicating if destruction animation is active.
+        :param liquefaction_effect_scale: Float (0.0 to 1.0) for ground deformation intensity.
         """
         biome_props = self.biome_generator.get_biome_properties(current_biome_code)
         sky_color = biome_props["sky"]
         ground_color = biome_props["ground"]
 
         self.screen.fill(sky_color)
-
-        ground_points = self.biome_generator.generate_ground_points(current_biome_code)
+        ground_points = self.biome_generator.generate_ground_points(current_biome_code, liquefaction_effect_scale=liquefaction_effect_scale)
         pygame.draw.polygon(self.screen, ground_color, ground_points)
         
         if clouds:
@@ -138,10 +139,10 @@ class Renderer:
                 if destruction_animation_playing and active_fragments: # Render fragments during animation
                     self.render_fragments(active_fragments)
                 elif not destruction_animation_playing: # Animation done, show static rubble
-                    self.render_static_rubble_pile(building_to_draw, building_x_position, current_biome_code)
+                    self.render_static_rubble_pile(building_to_draw, building_x_position, current_biome_code, liquefaction_effect_scale)
             else: # Building not destroyed
                 if building_x_position is not None:
-                    self.render_building(building_to_draw, building_x_position, current_biome_code)
+                    self.render_building(building_to_draw, building_x_position, current_biome_code, liquefaction_effect_scale)
 
     def render_clouds(self, clouds):
         """Renders a list of Cloud objects."""
@@ -154,12 +155,13 @@ class Renderer:
                 puff_rect.centery = cloud.rect.centery + offset_y
                 pygame.draw.ellipse(self.screen, cloud.color, puff_rect)
 
-    def render_building(self, building, x_center_screen, biome_code):
+    def render_building(self, building, x_center_screen, biome_code, liquefaction_effect_scale=0.0):
         """
         Renders a single building.
         :param building: The Building object to render.
         :param x_center_screen: The screen x-coordinate for the center of the building.
         :param biome_code: The current biome code to determine ground height.
+        :param liquefaction_effect_scale: Float (0.0 to 1.0) for ground deformation intensity.
         """
         # This check is now handled in render_world to allow for animation
         # if building.is_destroyed:
@@ -179,8 +181,8 @@ class Renderer:
         building_x_right = x_center_screen + building_width_pixels / 2
 
         # Get ground y-coordinates at the left and right edges of the building
-        ground_y_left = self.biome_generator.get_ground_y_at_x(building_x_left, biome_code)
-        ground_y_right = self.biome_generator.get_ground_y_at_x(building_x_right, biome_code)
+        ground_y_left = self.biome_generator.get_ground_y_at_x(building_x_left, biome_code, liquefaction_effect_scale)
+        ground_y_right = self.biome_generator.get_ground_y_at_x(building_x_right, biome_code, liquefaction_effect_scale)
 
         # Calculate horizontal shear displacement at the top due to angular displacement
         # Using tan for shear effect: dx = height * tan(angle)
@@ -239,16 +241,16 @@ class Renderer:
         for fragment in fragments:
             fragment.draw(self.screen)
 
-    def render_static_rubble_pile(self, building, x_center_screen, biome_code):
+    def render_static_rubble_pile(self, building, x_center_screen, biome_code, liquefaction_effect_scale=0.0):
         """Renders a simple representation of a destroyed building."""
         rubble_width_pixels = building.footprint_length * settings.METERS_TO_PIXELS * 1.2
         rubble_height_pixels = building.total_height * settings.METERS_TO_PIXELS * 0.2
 
         building_x_left = x_center_screen - rubble_width_pixels / 2
         building_x_right = x_center_screen + rubble_width_pixels / 2
-
-        ground_y_left = self.biome_generator.get_ground_y_at_x(building_x_left, biome_code)
-        ground_y_right = self.biome_generator.get_ground_y_at_x(building_x_right, biome_code)
+        # Use liquefaction status for ground level under rubble too
+        ground_y_left = self.biome_generator.get_ground_y_at_x(building_x_left, biome_code, liquefaction_effect_scale)
+        ground_y_right = self.biome_generator.get_ground_y_at_x(building_x_right, biome_code, liquefaction_effect_scale)
         
         # Simple rubble pile as a polygon
         points = [

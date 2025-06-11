@@ -78,18 +78,29 @@ class BiomeGenerator:
             return BIOME_DATA[DEFAULT_BIOME_CODE]
         return BIOME_DATA[biome_code]
 
-    def generate_ground_points(self, biome_code, num_points=None):
+    def generate_ground_points(self, biome_code, num_points=None, liquefaction_effect_scale=0.0):
         """
         Generates a list of (x, y) points for a curvy ground polygon.
         The number of points can be specified, or defaults to screen_width / 10 for reasonable detail.
         :param biome_code: The Koppen code for the biome.
         :param num_points: The number of points to generate for the top edge of the terrain.
+        :param liquefaction_effect_scale: Float (0.0 to 1.0) controlling the intensity of liquefaction deformation.
         :return: A list of (x,y) tuples representing the vertices of the ground polygon.
         """
-        props = self.get_biome_properties(biome_code)
+        props_orig = self.get_biome_properties(biome_code)
+        props = props_orig.copy() # Work with a copy to modify for liquefaction
+
         base_ground_y = self.screen_height * props["base_height_factor"]
-        amplitude = props["amplitude"]
-        frequency = props["frequency"]
+        
+        # Liquefaction effect parameters
+        max_amplitude_increase_factor = 1.8 # e.g., ground waves can be 80% taller
+        max_frequency_increase_factor = 1.5 # e.g., ground waves can be 50% more frequent
+
+        amplitude_multiplier = 1.0 + (max_amplitude_increase_factor - 1.0) * liquefaction_effect_scale
+        frequency_multiplier = 1.0 + (max_frequency_increase_factor - 1.0) * liquefaction_effect_scale
+        
+        amplitude = props["amplitude"] * amplitude_multiplier
+        frequency = props["frequency"] * frequency_multiplier
         phase_shift = props.get("phase_shift", 0.0) # Use .get for backward compatibility if not all biomes have it
 
         if num_points is None:
@@ -114,18 +125,29 @@ class BiomeGenerator:
         """
         return list(BIOME_DATA.keys())
 
-    def get_ground_y_at_x(self, x_coord, biome_code):
+    def get_ground_y_at_x(self, x_coord, biome_code, liquefaction_effect_scale=0.0):
         """
         Calculates the y-coordinate of the ground at a specific x-coordinate
         based on the biome's terrain generation parameters.
         :param x_coord: The x-coordinate on the screen.
         :param biome_code: The Koppen code for the biome.
+        :param liquefaction_effect_scale: Float (0.0 to 1.0) controlling the intensity of liquefaction deformation.
         :return: The y-coordinate of the ground.
         """
-        props = self.get_biome_properties(biome_code)
+        props_orig = self.get_biome_properties(biome_code)
+        props = props_orig.copy() # Work with a copy
+
         base_ground_y = self.screen_height * props["base_height_factor"]
-        amplitude = props["amplitude"]
-        frequency = props["frequency"]
+
+        # Liquefaction effect parameters (should match generate_ground_points)
+        max_amplitude_increase_factor = 1.8
+        max_frequency_increase_factor = 1.5
+
+        amplitude_multiplier = 1.0 + (max_amplitude_increase_factor - 1.0) * liquefaction_effect_scale
+        frequency_multiplier = 1.0 + (max_frequency_increase_factor - 1.0) * liquefaction_effect_scale
+
+        amplitude = props["amplitude"] * amplitude_multiplier
+        frequency = props["frequency"] * frequency_multiplier
         phase_shift = props.get("phase_shift", 0.0)
 
         y_offset = amplitude * math.sin(frequency * x_coord + phase_shift)
