@@ -111,7 +111,8 @@ def main():
         clouds.append(create_cloud())
 
     # --- Game State ---
-    current_biome = "Dfc" # Example: Hot Desert
+    available_biomes = biome_generator.get_available_biomes()
+    current_biome = random.choice(available_biomes) if available_biomes else "Dfc" # Randomly select, fallback if list is empty
     game_over_prompt_active = False
     destruction_animation_playing = False
     active_fragments = [] # Changed from active_debris
