@@ -100,6 +100,35 @@ class BuildingFragment:
             pygame.draw.polygon(surface, self.color, world_points_pixels)
             pygame.draw.polygon(surface, settings.BLACK, world_points_pixels, 1) # Outline
 
+class WindParticle:
+    def __init__(self, screen_width, screen_height, velocity_mps):
+        self.screen_width = screen_width
+        self.screen_height = screen_height
+        self.velocity_x_pixels_s = velocity_mps * settings.METERS_TO_PIXELS
+        
+        self.y = random.randint(0, screen_height)
+        # Start off-screen, direction depends on velocity (assume positive velocity is left-to-right wind)
+        self.x = random.randint(-screen_width // 4, 0) if self.velocity_x_pixels_s > 0 else random.randint(screen_width, screen_width + screen_width // 4)
+        
+        self.length = max(5, abs(self.velocity_x_pixels_s) * 0.05) # Length based on speed
+        self.color = (200, 200, 220, 150) # Semi-transparent light grey/blue
+
+    def update(self, delta_time):
+        self.x += self.velocity_x_pixels_s * delta_time
+        # Reset if off-screen
+        if self.velocity_x_pixels_s > 0 and self.x > self.screen_width + self.length:
+            self.x = -self.length
+            self.y = random.randint(0, self.screen_height)
+        elif self.velocity_x_pixels_s < 0 and self.x < -self.length:
+            self.x = self.screen_width + self.length
+            self.y = random.randint(0, self.screen_height)
+
+    def draw(self, surface):
+        # Draw as a short horizontal line
+        start_pos = (self.x, self.y)
+        end_pos = (self.x + self.length * math.copysign(1, self.velocity_x_pixels_s), self.y)
+        pygame.draw.line(surface, self.color, start_pos, end_pos, 1)
+
 class Renderer:
     def __init__(self, screen, biome_generator):
         """
@@ -111,7 +140,7 @@ class Renderer:
         self.biome_generator = biome_generator
         # self.liquefaction_visuals_active = False # Replaced by liquefaction_effect_scale
 
-    def render_world(self, current_biome_code="Af", building_to_draw=None, building_x_position=None, clouds=None, active_fragments=None, destruction_animation_playing=False, liquefaction_effect_scale=0.0):
+    def render_world(self, current_biome_code="Af", building_to_draw=None, building_x_position=None, clouds=None, active_fragments=None, destruction_animation_playing=False, liquefaction_effect_scale=0.0, wind_particles=None):
         """
         Renders the game world based on the current biome.
         For a side view, this means a sky and a curvy ground.
@@ -122,6 +151,7 @@ class Renderer:
         :param active_fragments: Optional list of BuildingFragment objects.
         :param destruction_animation_playing: Boolean indicating if destruction animation is active.
         :param liquefaction_effect_scale: Float (0.0 to 1.0) for ground deformation intensity.
+        :param wind_particles: Optional list of WindParticle objects.
         """
         biome_props = self.biome_generator.get_biome_properties(current_biome_code)
         sky_color = biome_props["sky"]
@@ -130,6 +160,9 @@ class Renderer:
         self.screen.fill(sky_color)
         ground_points = self.biome_generator.generate_ground_points(current_biome_code, liquefaction_effect_scale=liquefaction_effect_scale)
         pygame.draw.polygon(self.screen, ground_color, ground_points)
+
+        if wind_particles:
+            self.render_wind_particles(wind_particles)
         
         if clouds:
             self.render_clouds(clouds)
@@ -263,3 +296,8 @@ class Renderer:
         pygame.draw.polygon(self.screen, settings.GRAY, points)
         pygame.draw.polygon(self.screen, settings.BLACK, points, 2)
         # Could add "DESTROYED" text here too
+
+    def render_wind_particles(self, wind_particles):
+        """Renders wind particles."""
+        for particle in wind_particles:
+            particle.draw(self.screen)

@@ -2,7 +2,7 @@ import pygame
 import random
 import math # Import the math module
 from config import settings
-from graphics.renderer import Renderer, Cloud, BuildingFragment # Import BuildingFragment
+from graphics.renderer import Renderer, Cloud, BuildingFragment, WindParticle # Import WindParticle
 from core.biome_generator import BiomeGenerator # Import BiomeGenerator
 from core.building_structure import Building, CONCRETE # Import Building and an example material
 import pygame_gui
@@ -51,7 +51,7 @@ def main():
 
     # Wind Speed Slider (placing it next to the button or above it)
     pygame_gui.elements.UILabel(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 2 - ui_margin - label_height), (label_width, label_height)), text="Wind Speed (m/s):", manager=ui_manager)
-    wind_speed_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 2 - ui_margin), (slider_width, slider_height)), start_value=initial_wind_speed, value_range=(0.0, 6000.0), manager=ui_manager, object_id="#wind_speed_slider")
+    wind_speed_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 2 - ui_margin), (slider_width, slider_height)), start_value=initial_wind_speed, value_range=(0.0, 80.0), manager=ui_manager, object_id="#wind_speed_slider")
 
     # Event Button
     action_button_width = 150
@@ -126,6 +126,8 @@ def main():
     liquefaction_is_active_for_physics = False # For building stiffness reduction
     liquefaction_threshold_g = 0.3 # PGA in g to trigger liquefaction
     LIQUEFACTION_SWAY_FREQUENCY_HZ = 0.5 # How fast the ground sways during liquefaction
+    
+    active_wind_particles = []
 
     running = True
     while running:
@@ -169,9 +171,16 @@ def main():
                 if event.type == pygame_gui.UI_BUTTON_PRESSED:
                     if event.ui_element == simulate_wind_button and not sample_building.is_destroyed:
                         wind_speed_mps = wind_speed_slider.get_current_value()
+                        active_wind_particles.clear() # Clear old particles
+                        if wind_speed_mps > 0.1: # Only generate if there's some wind
+                            num_wind_particles = int(wind_speed_mps * 1.5) # More particles for higher speed
+                            for _ in range(min(num_wind_particles, 150)): # Cap max particles
+                                active_wind_particles.append(WindParticle(settings.SCREEN_WIDTH, settings.SCREEN_HEIGHT, wind_speed_mps))
+                        
                         print(f"Simulating wind at {wind_speed_mps:.1f} m/s")
                         exposed_area = sample_building.total_height * sample_building.footprint_length 
                         wind_force_newtons = 0.5 * settings.AIR_DENSITY * (wind_speed_mps**2) * exposed_area * settings.DEFAULT_DRAG_COEFFICIENT
+                        # Assuming wind from left to right, so positive force
                         sample_building.apply_horizontal_force(wind_force_newtons, sample_building.total_height / 2)
                     
                     elif event.ui_element == simulate_earthquake_button and not sample_building.is_destroyed:
@@ -218,6 +227,10 @@ def main():
                 elif cloud.speed < 0 and cloud.rect.right < 0:
                     cloud.rect.left = settings.SCREEN_WIDTH
                     cloud.rect.y = random.randint(20, settings.SCREEN_HEIGHT // 3)
+            
+            # Update Wind Particles
+            for particle in active_wind_particles:
+                particle.update(time_delta)
             # Update Building Physics
             sample_building.update_physics(time_delta)
 
@@ -283,7 +296,7 @@ def main():
         ui_manager.update(time_delta)
 
         # --- Rendering ---
-        renderer.render_world(current_biome, sample_building, building_base_screen_x_center, clouds, active_fragments, destruction_animation_playing, liquefaction_effect_scale=current_liquefaction_effect_scale)
+        renderer.render_world(current_biome, sample_building, building_base_screen_x_center, clouds, active_fragments, destruction_animation_playing, liquefaction_effect_scale=current_liquefaction_effect_scale, wind_particles=active_wind_particles)
         ui_manager.draw_ui(screen) # Draw pygame_gui elements
 
         pygame.display.flip()
