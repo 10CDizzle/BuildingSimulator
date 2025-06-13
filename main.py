@@ -2,7 +2,7 @@ import pygame
 import random
 import math # Import the math module
 from config import settings
-from graphics.renderer import Renderer, Cloud, BuildingFragment, WindParticle # Import WindParticle
+from graphics.renderer import Renderer, Cloud, BuildingFragment, WindParticle, RainParticle # Import RainParticle
 from core.biome_generator import BiomeGenerator # Import BiomeGenerator
 from core.building_structure import Building, CONCRETE # Import Building and an example material
 import pygame_gui
@@ -65,6 +65,12 @@ def main():
     # Earthquake Button
     simulate_earthquake_button = pygame_gui.elements.UIButton(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - action_button_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 3 - ui_margin), (action_button_width, button_height)), text='Simulate Earthquake', manager=ui_manager, object_id="#earthquake_button")
 
+    # Rainfall Intensity Slider
+    initial_rainfall_intensity = 0.0 # mm/hr
+    pygame_gui.elements.UILabel(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 6 - ui_margin - label_height), (label_width, label_height)), text="Rainfall (mm/hr):", manager=ui_manager)
+    rainfall_intensity_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 6 - ui_margin), (slider_width, slider_height)), start_value=initial_rainfall_intensity, value_range=(0.0, 200.0), manager=ui_manager, object_id="#rainfall_intensity_slider")
+    # Rainfall Button (Toggle)
+    toggle_rain_button = pygame_gui.elements.UIButton(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - action_button_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 5 - ui_margin), (action_button_width, button_height)), text='Start Rainfall', manager=ui_manager, object_id="#rain_button")
 
     # Store sliders for easy access if needed, or use object_ids
     sliders = {
@@ -128,6 +134,14 @@ def main():
     LIQUEFACTION_SWAY_FREQUENCY_HZ = 0.5 # How fast the ground sways during liquefaction
     
     active_wind_particles = []
+    active_rain_particles = []
+    is_raining = False
+    current_rainfall_intensity_mm_hr = 0.0
+    
+    # Flood mechanics
+    current_flood_water_level_m = 0.0  # Meters above a baseline (e.g., average initial ground height)
+    FLOOD_BASELINE_Y_FACTOR = 0.75 # Water level relative to this fraction of screen height
+    flood_drain_rate_m_per_s = 0.0005 # Slow drainage
 
     running = True
     while running:
@@ -195,6 +209,22 @@ def main():
                                 sample_building.set_stiffness_reduction_for_liquefaction(True) # Reduce building stiffness
                         else:
                             print("Earthquake already in progress.")
+                    
+                    elif event.ui_element == toggle_rain_button and not sample_building.is_destroyed:
+                        is_raining = not is_raining
+                        if is_raining:
+                            toggle_rain_button.set_text("Stop Rainfall")
+                            current_rainfall_intensity_mm_hr = rainfall_intensity_slider.get_current_value()
+                            active_rain_particles.clear()
+                            num_rain_particles = int(current_rainfall_intensity_mm_hr * 0.5) # Density based on intensity
+                            for _ in range(min(num_rain_particles, 300)): # Cap particles
+                                x_pos = random.randint(0, settings.SCREEN_WIDTH)
+                                speed = random.uniform(200, 400) # pixels/sec
+                                length = random.uniform(5, 15)
+                                active_rain_particles.append(RainParticle(x_pos, settings.SCREEN_HEIGHT, speed, length))
+                        else:
+                            toggle_rain_button.set_text("Start Rainfall")
+                            active_rain_particles.clear() # Stop rain particles immediately
 
             
             # Handle confirmation dialog events
@@ -203,6 +233,7 @@ def main():
                     print("Restarting simulation...")
                     sample_building = create_new_building() # Reset building
                     liquefaction_is_active_for_physics = False # Ensure liquefaction physics off on restart
+                    current_flood_water_level_m = 0.0 # Reset flood
                     game_over_prompt_active = False
                     confirmation_dialog = None # Clear the reference
             
@@ -211,6 +242,7 @@ def main():
                      if event.ui_element == confirmation_dialog:
                         print("Exiting after destruction.")
                         liquefaction_is_active_for_physics = False # Ensure liquefaction physics off on exit
+                        current_flood_water_level_m = 0.0
                         running = False # Or just keep game_over_prompt_active = True
                         game_over_prompt_active = False # Allow exit
                         confirmation_dialog = None
@@ -230,6 +262,10 @@ def main():
             
             # Update Wind Particles
             for particle in active_wind_particles:
+                particle.update(time_delta)
+            
+            # Update Rain Particles
+            for particle in active_rain_particles:
                 particle.update(time_delta)
             # Update Building Physics
             sample_building.update_physics(time_delta)
@@ -257,6 +293,17 @@ def main():
                         sample_building.set_stiffness_reduction_for_liquefaction(False) # Restore stiffness
                         liquefaction_is_active_for_physics = False
                     print("Earthquake finished.")
+            
+            # Update flood level
+            if is_raining and current_rainfall_intensity_mm_hr > 0:
+                # Convert mm/hr to m/s for rise rate
+                # 1 mm/hr = 1/1000 m / 3600 s = 2.77e-7 m/s
+                # Let's use a more impactful arbitrary factor for visual effect for now
+                rise_rate_factor = 0.0001 # Arbitrary factor to make flooding visible faster
+                current_flood_water_level_m += current_rainfall_intensity_mm_hr * rise_rate_factor * time_delta
+            
+            current_flood_water_level_m -= flood_drain_rate_m_per_s * time_delta
+            current_flood_water_level_m = max(0, current_flood_water_level_m)
 
             # Check for destruction and show prompt
             if sample_building.is_destroyed and not destruction_animation_playing:
@@ -295,8 +342,11 @@ def main():
 
         ui_manager.update(time_delta)
 
+        # Calculate flood water surface Y in pixels
+        flood_baseline_y_px = settings.SCREEN_HEIGHT * FLOOD_BASELINE_Y_FACTOR
+        flood_water_surface_y_pixels = flood_baseline_y_px - (current_flood_water_level_m * settings.METERS_TO_PIXELS)
         # --- Rendering ---
-        renderer.render_world(current_biome, sample_building, building_base_screen_x_center, clouds, active_fragments, destruction_animation_playing, liquefaction_effect_scale=current_liquefaction_effect_scale, wind_particles=active_wind_particles)
+        renderer.render_world(current_biome, sample_building, building_base_screen_x_center, clouds, active_fragments, destruction_animation_playing, liquefaction_effect_scale=current_liquefaction_effect_scale, wind_particles=active_wind_particles, rain_particles=active_rain_particles, flood_water_surface_y_px=flood_water_surface_y_pixels)
         ui_manager.draw_ui(screen) # Draw pygame_gui elements
 
         pygame.display.flip()

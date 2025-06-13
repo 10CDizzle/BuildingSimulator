@@ -100,6 +100,25 @@ class BuildingFragment:
             pygame.draw.polygon(surface, self.color, world_points_pixels)
             pygame.draw.polygon(surface, settings.BLACK, world_points_pixels, 1) # Outline
 
+class RainParticle:
+    def __init__(self, x_start, screen_height, speed_y, length, color=(173, 216, 230, 180)): # Light blue, semi-transparent
+        self.x = x_start
+        self.y = random.randint(-screen_height // 4, 0) # Start above screen
+        self.screen_height = screen_height
+        self.speed_y = speed_y
+        self.length = length
+        self.color = color
+
+    def update(self, delta_time):
+        self.y += self.speed_y * delta_time
+        if self.y > self.screen_height:
+            self.y = random.randint(-self.screen_height // 4, -self.length) # Reset above screen
+            # self.x can be re-randomized if you want rain to appear in different columns
+
+    def draw(self, surface):
+        pygame.draw.line(surface, self.color, (self.x, self.y), (self.x, self.y + self.length), 1)
+
+
 class WindParticle:
     def __init__(self, screen_width, screen_height, velocity_mps):
         self.screen_width = screen_width
@@ -140,7 +159,7 @@ class Renderer:
         self.biome_generator = biome_generator
         # self.liquefaction_visuals_active = False # Replaced by liquefaction_effect_scale
 
-    def render_world(self, current_biome_code="Af", building_to_draw=None, building_x_position=None, clouds=None, active_fragments=None, destruction_animation_playing=False, liquefaction_effect_scale=0.0, wind_particles=None):
+    def render_world(self, current_biome_code="Af", building_to_draw=None, building_x_position=None, clouds=None, active_fragments=None, destruction_animation_playing=False, liquefaction_effect_scale=0.0, wind_particles=None, rain_particles=None, flood_water_surface_y_px=None):
         """
         Renders the game world based on the current biome.
         For a side view, this means a sky and a curvy ground.
@@ -152,6 +171,8 @@ class Renderer:
         :param destruction_animation_playing: Boolean indicating if destruction animation is active.
         :param liquefaction_effect_scale: Float (0.0 to 1.0) for ground deformation intensity.
         :param wind_particles: Optional list of WindParticle objects.
+        :param rain_particles: Optional list of RainParticle objects.
+        :param flood_water_surface_y_px: Optional Y-coordinate for the flood water surface.
         """
         biome_props = self.biome_generator.get_biome_properties(current_biome_code)
         sky_color = biome_props["sky"]
@@ -161,11 +182,17 @@ class Renderer:
         ground_points = self.biome_generator.generate_ground_points(current_biome_code, liquefaction_effect_scale=liquefaction_effect_scale)
         pygame.draw.polygon(self.screen, ground_color, ground_points)
 
+        if flood_water_surface_y_px is not None:
+            self.render_flood_water(flood_water_surface_y_px, ground_points, liquefaction_effect_scale)
+
         if wind_particles:
             self.render_wind_particles(wind_particles)
         
         if clouds:
             self.render_clouds(clouds)
+
+        if rain_particles:
+            self.render_rain_particles(rain_particles)
 
         if building_to_draw:
             if building_to_draw.is_destroyed:
@@ -301,3 +328,30 @@ class Renderer:
         """Renders wind particles."""
         for particle in wind_particles:
             particle.draw(self.screen)
+
+    def render_rain_particles(self, rain_particles):
+        """Renders rain particles."""
+        for particle in rain_particles:
+            particle.draw(self.screen)
+
+    def render_flood_water(self, water_surface_y_px, underlying_ground_points, liquefaction_effect_scale):
+        """
+        Renders flood water. The water surface is flat.
+        :param water_surface_y_px: The y-coordinate of the flat water surface.
+        :param underlying_ground_points: The points defining the current ground surface.
+        :param liquefaction_effect_scale: Current scale of liquefaction for ground points.
+        """
+        if water_surface_y_px >= self.screen.get_height() -1: # No water visible or below screen
+            return
+
+        water_color = (64, 164, 223, 150) # Semi-transparent blue
+        
+        # Create a polygon for the water body
+        water_poly_points = [(0, water_surface_y_px), (self.screen.get_width(), water_surface_y_px)]
+        water_poly_points.extend(reversed([pt for pt in underlying_ground_points if pt[1] >= water_surface_y_px][:-2])) # Add ground points below water, in reverse
+        
+        if len(water_poly_points) > 2: # Need at least 3 points for a polygon
+            # Create a temporary surface for transparency
+            s = pygame.Surface((self.screen.get_width(), self.screen.get_height()), pygame.SRCALPHA)
+            pygame.draw.polygon(s, water_color, water_poly_points)
+            self.screen.blit(s, (0,0))
