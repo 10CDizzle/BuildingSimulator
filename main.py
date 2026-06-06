@@ -174,13 +174,8 @@ def main():
                         sample_building.footprint_width = round(event.value, 1)
                         parameter_changed = True
                     
-                    if parameter_changed and not sample_building.is_destroyed: # Recalculate derived properties and mass
-                        sample_building.total_height = sample_building.num_stories * sample_building.story_height
-                        sample_building.aspect_ratio_l = sample_building.total_height / sample_building.footprint_length if sample_building.footprint_length > 0 else float('inf')
-                        sample_building.aspect_ratio_w = sample_building.total_height / sample_building.footprint_width if sample_building.footprint_width > 0 else float('inf')
-                        sample_building.calculated_mass = sample_building._calculate_total_mass() # Recalculate mass
-                        if sample_building.calculated_mass <= 0: sample_building.calculated_mass = 1000 # Safety
-                        sample_building.moment_of_inertia_kg_m2 = (1/3) * sample_building.calculated_mass * (sample_building.total_height**2) if sample_building.total_height > 0 else 1e6
+                    if parameter_changed and not sample_building.is_destroyed:
+                        sample_building.recompute_derived_properties()
 
                 if event.type == pygame_gui.UI_BUTTON_PRESSED:
                     if event.ui_element == simulate_wind_button and not sample_building.is_destroyed:

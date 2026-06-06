@@ -6,20 +6,24 @@ from graphics.renderer import BuildingFragment
 
 class Material:
     """Represents material properties for building components."""
-    def __init__(self, name: str, elastic_modulus: float, density: float, damping_ratio: float, shear_strength: float):
+    def __init__(self, name: str, elastic_modulus: float, density: float, damping_ratio: float,
+                 shear_strength: float, allowable_axial_stress: float):
         self.name = name
         self.elastic_modulus = elastic_modulus  # E, in Pascals (Pa)
         self.density = density                  # kg/m^3
         self.damping_ratio = damping_ratio      # Dimensionless
         self.shear_strength = shear_strength    # Pascals (Pa)
+        # Working/allowable axial compressive stress, used to size columns for the
+        # gravity load they carry (Pa). Roughly service-level values.
+        self.allowable_axial_stress = allowable_axial_stress
 
     def __str__(self):
         return self.name
 
 # Example predefined materials - these could be loaded from a config file later
-CONCRETE = Material(name="Concrete", elastic_modulus=30e9, density=2400, damping_ratio=0.05, shear_strength=2.5e6)
-STEEL = Material(name="Steel", elastic_modulus=200e9, density=7850, damping_ratio=0.02, shear_strength=250e6)
-WOOD = Material(name="Wood", elastic_modulus=10e9, density=600, damping_ratio=0.07, shear_strength=5e6)
+CONCRETE = Material(name="Concrete", elastic_modulus=30e9, density=2400, damping_ratio=0.05, shear_strength=2.5e6, allowable_axial_stress=12e6)
+STEEL = Material(name="Steel", elastic_modulus=200e9, density=7850, damping_ratio=0.02, shear_strength=250e6, allowable_axial_stress=150e6)
+WOOD = Material(name="Wood", elastic_modulus=10e9, density=600, damping_ratio=0.07, shear_strength=5e6, allowable_axial_stress=8e6)
 
 
 class MassDistribution(Enum):
@@ -96,12 +100,9 @@ class Building:
         # Structural Parameters
         self.num_stories = num_stories
         self.story_height = story_height
-        self.total_height = num_stories * story_height
 
         self.footprint_length = footprint_length
         self.footprint_width = footprint_width
-        self.aspect_ratio_l = self.total_height / self.footprint_length if self.footprint_length > 0 else float('inf')
-        self.aspect_ratio_w = self.total_height / self.footprint_width if self.footprint_width > 0 else float('inf')
 
         self.mass_distribution = mass_distribution
         self.primary_material = primary_material
@@ -129,11 +130,6 @@ class Building:
         self.retrofitting_measures = retrofitting_measures if retrofitting_measures is not None else []
 
         # --- Physics State ---
-        self.calculated_mass: float = self._calculate_total_mass()
-        # Ensure mass is not zero to avoid division by zero errors
-        if self.calculated_mass <= 0:
-            self.calculated_mass = 1000 # Default small mass if calculation fails
-
         self.is_destroyed: bool = False
 
         self.angular_displacement_rad: float = 0.0       # Current sway angle
@@ -142,11 +138,31 @@ class Building:
         self.rotational_stiffness_nm_per_rad = rotational_stiffness_nm_per_rad
         self.rotational_damping_nm_s_per_rad = rotational_damping_nm_s_per_rad
         self.original_rotational_stiffness = rotational_stiffness_nm_per_rad # Store for liquefaction
-        # Moment of inertia (approx. as thin rod rotating about base: 1/3 * m * h^2)
-        self.moment_of_inertia_kg_m2: float = (1/3) * self.calculated_mass * (self.total_height**2) if self.total_height > 0 else 1e6
         self.max_safe_angular_displacement_rad = max_safe_angular_displacement_rad
 
-        self.calculated_natural_period: float = self._calculate_natural_period()
+        # Geometry-, mass-, and inertia-derived quantities (total_height, aspect
+        # ratios, calculated_mass, moment_of_inertia_kg_m2, calculated_natural_period).
+        self.recompute_derived_properties()
+
+    def recompute_derived_properties(self):
+        """Recompute all properties derived from the structural parameters.
+
+        Call this after changing num_stories, story_height, or the footprint so
+        dependent quantities stay consistent. This is the single source of truth
+        shared by __init__ and runtime UI edits, so the two can't drift apart.
+        """
+        self.total_height = self.num_stories * self.story_height
+        self.aspect_ratio_l = self.total_height / self.footprint_length if self.footprint_length > 0 else float('inf')
+        self.aspect_ratio_w = self.total_height / self.footprint_width if self.footprint_width > 0 else float('inf')
+
+        self.calculated_mass = self._calculate_total_mass()
+        if self.calculated_mass <= 0:
+            self.calculated_mass = 1000  # Safety against division-by-zero downstream
+
+        # Moment of inertia (approx. as thin rod rotating about base: 1/3 * m * h^2)
+        self.moment_of_inertia_kg_m2 = (1/3) * self.calculated_mass * (self.total_height ** 2) if self.total_height > 0 else 1e6
+
+        self.calculated_natural_period = self._calculate_natural_period()
 
     def _calculate_total_mass(self) -> float:
         # Placeholder: More detailed calculation needed based on geometry, materials, system
