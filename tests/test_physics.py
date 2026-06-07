@@ -629,5 +629,92 @@ class LoadCouplingTests(unittest.TestCase):
         np.testing.assert_allclose(u, np.linalg.solve(K, Q), rtol=1e-3)
 
 
+class ProgressiveCollapseTests(unittest.TestCase):
+    def _building(self, **kw):
+        params = dict(num_stories=8, story_height=3.0, footprint_length=18.0,
+                      footprint_width=12.0, primary_material=CONCRETE)
+        params.update(kw)
+        return Building(**params)
+
+    def test_story_drifts(self):
+        h = 3.0
+        v = np.array([1.0, 2.0, 3.0])  # uniform inter-story displacement of 1
+        np.testing.assert_allclose(physics.story_drifts(v, h), np.full(3, 1.0 / h))
+        v2 = np.array([1.0, 1.0, 1.0])  # only the first story strains
+        np.testing.assert_allclose(physics.story_drifts(v2, h), [1.0 / h, 0.0, 0.0])
+
+    def test_capacity_increases_with_ductility(self):
+        brittle = self._building(ductility_level=0.05)
+        ductile = self._building(ductility_level=0.95)
+        self.assertGreater(physics.drift_capacity(ductile), physics.drift_capacity(brittle))
+
+    def test_no_failure_below_capacity(self):
+        b = self._building()
+        pc = physics.ProgressiveCollapse(b)
+        tiny = np.full(b.num_stories, 1e-5)
+        self.assertFalse(pc.update(tiny))
+        self.assertFalse(pc.failed.any())
+        self.assertFalse(pc.is_collapsed)
+
+    def test_failure_triggers_when_drift_exceeds_capacity(self):
+        b = self._building()
+        pc = physics.ProgressiveCollapse(b)
+        h = b.story_height
+        v = np.zeros(b.num_stories)
+        v[0] = 1.5 * pc.capacity * h  # first story drift = 1.5x capacity
+        v[1:] = v[0]                  # upper stories ride along (no extra drift)
+        self.assertTrue(pc.update(v))
+        self.assertTrue(pc.failed[0])
+        self.assertFalse(pc.failed[1])
+
+    def test_hinge_softens_stiffness(self):
+        b = self._building()
+        pc = physics.ProgressiveCollapse(b)
+        k_intact = pc.stiffness_matrix()
+        pc.failed[0] = True
+        k_damaged = pc.stiffness_matrix()
+        # Softening a story lowers the fundamental stiffness (smallest eigenvalue).
+        self.assertLess(np.linalg.eigvalsh(k_damaged)[0], np.linalg.eigvalsh(k_intact)[0])
+
+    def test_update_reports_change_only_on_new_failure(self):
+        b = self._building()
+        pc = physics.ProgressiveCollapse(b)
+        h = b.story_height
+        v = np.full(b.num_stories, 1.5 * pc.capacity * h)
+        v = np.cumsum(np.full(b.num_stories, 1.5 * pc.capacity * h))  # every story over capacity
+        self.assertTrue(pc.update(v))     # first time: stories fail
+        self.assertFalse(pc.update(v))    # same state: nothing newly failed
+
+    def test_sustained_overload_cascades_to_collapse(self):
+        """Drive a heavy static load, refactorising as stories hinge; expect collapse."""
+        b = self._building(ductility_level=0.4)
+        M = physics.assemble_mass_matrix(physics.floor_masses(b))
+        pc = physics.ProgressiveCollapse(b)
+        K = pc.stiffness_matrix()
+        modal = physics.modal_analysis(M, K)
+        C = physics.damping_matrix(b, M, K, modal)
+
+        # Pick a load whose initial static drift just exceeds capacity.
+        probe = np.ones(b.num_stories)
+        u_probe = np.linalg.solve(K, probe)
+        max_drift = np.max(np.abs(physics.story_drifts(u_probe, b.story_height)))
+        F = probe * (1.4 * pc.capacity / max_drift)
+
+        dt = modal.periods[0] / 80.0
+        integ = physics.NewmarkIntegrator(M, C, K, dt)
+        u = np.zeros(b.num_stories); v = np.zeros(b.num_stories)
+        a = integ.initial_acceleration(u, v, F)
+
+        for _ in range(20000):
+            u, v, a = integ.step(u, v, a, F)
+            if pc.update(u):
+                integ.update_system(K=pc.stiffness_matrix())
+            if pc.is_collapsed:
+                break
+
+        self.assertTrue(pc.is_collapsed)
+        self.assertTrue(pc.failed.any())
+
+
 if __name__ == "__main__":
     unittest.main()

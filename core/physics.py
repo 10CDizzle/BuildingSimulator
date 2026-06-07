@@ -928,3 +928,79 @@ def flood_buoyancy(building, water_level, water_density=1000.0, displacement_fra
               * submerged_height * displacement_fraction)
     uplift = water_density * GRAVITY * volume
     return uplift, volume
+
+
+# ---------------------------------------------------------------------------
+# Progressive collapse (drift-based failure, hinging, redistribution)
+# ---------------------------------------------------------------------------
+
+def story_drifts(structural_displacements, story_height):
+    """Inter-story drift ratios from floor distortions relative to the base.
+
+    ``drift_i = (v_i - v_{i-1}) / h`` with ``v_0 = 0`` (the base). The input is
+    the structural part of the state (``q[:N]`` for the SSI system), since
+    rigid-body sway and rocking do not strain the structure.
+    """
+    v = np.asarray(structural_displacements, dtype=float)
+    inter_story = np.empty_like(v)
+    inter_story[0] = v[0]
+    inter_story[1:] = v[1:] - v[:-1]
+    return inter_story / story_height
+
+
+def drift_capacity(building, drift_min=0.005, drift_max=0.04):
+    """Allowable inter-story drift ratio, scaled by ductility.
+
+    Brittle systems (``ductility_level`` near 0) fail around 0.5% drift; highly
+    ductile ones tolerate ~4% before a story is lost.
+    """
+    return drift_min + building.ductility_level * (drift_max - drift_min)
+
+
+class ProgressiveCollapse:
+    """Tracks per-story failure and the resulting softened stiffness.
+
+    Each story carries an intact lateral rigidity; when its drift exceeds the
+    capacity it becomes a hinge with only ``residual_stiffness`` of its original
+    rigidity. Softening one story redistributes load to its neighbours, which can
+    push them past capacity in turn -- a cascade. Global collapse is declared
+    once any story reaches the (large) ``collapse_drift`` runaway threshold or
+    every story has hinged.
+    """
+
+    def __init__(self, building, residual_stiffness=0.05, collapse_drift=0.10):
+        self.story_height = building.story_height
+        self.num_stories = building.num_stories
+        self._EI0 = np.full(self.num_stories, flexural_rigidity(building))
+        self._GA0 = np.full(self.num_stories, shear_rigidity(building))
+        self.capacity = drift_capacity(building)
+        self.residual_stiffness = residual_stiffness
+        self.collapse_drift = collapse_drift
+        self.failed = np.zeros(self.num_stories, dtype=bool)
+        self.is_collapsed = False
+
+    def _factors(self):
+        return np.where(self.failed, self.residual_stiffness, 1.0)
+
+    def stiffness_matrix(self):
+        """Current structural stiffness with failed stories softened to hinges."""
+        factors = self._factors()
+        return assemble_shear_flexural_stiffness(
+            self._EI0 * factors, self._GA0 * factors,
+            self.story_height, self.num_stories)
+
+    def update(self, structural_displacements):
+        """Update failure state from the current deflection.
+
+        Returns ``True`` if any story newly failed (so the caller should rebuild
+        the stiffness matrix and refactorise the integrator).
+        """
+        drifts = np.abs(story_drifts(structural_displacements, self.story_height))
+        over_capacity = drifts > self.capacity
+        newly_failed = over_capacity & ~self.failed
+        changed = bool(newly_failed.any())
+        self.failed |= over_capacity
+
+        if np.any(drifts > self.collapse_drift) or self.failed.all():
+            self.is_collapsed = True
+        return changed
