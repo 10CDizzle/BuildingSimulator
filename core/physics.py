@@ -24,6 +24,8 @@ Newmark-beta integrator, soil-structure interaction, loads, and progressive
 collapse.
 """
 
+from dataclasses import dataclass
+
 import numpy as np
 
 # --- Physical constants -----------------------------------------------------
@@ -42,16 +44,21 @@ MIN_COLUMN_AREA_M2 = 0.09        # 300 mm x 300 mm minimum practical column
 # Section / structural property derivation
 # ---------------------------------------------------------------------------
 
-def estimate_column_count(footprint_length, footprint_width, bay_spacing=DEFAULT_BAY_SPACING_M):
-    """Number of vertical columns on a regular bay grid covering the footprint.
+def column_grid(footprint_length, footprint_width, bay_spacing=DEFAULT_BAY_SPACING_M):
+    """Column grid ``(nx, ny)`` covering the footprint at ~``bay_spacing`` bays.
 
-    A building ``footprint_length`` x ``footprint_width`` metres is gridded into
-    bays roughly ``bay_spacing`` metres apart, giving ``(nx) x (ny)`` columns at
-    the grid intersections. A minimum 2x2 grid is enforced so every building has
+    ``nx`` is the number of column lines along the length (loading) direction,
+    ``ny`` along the width. A minimum 2x2 grid is enforced so every building has
     corner columns.
     """
     nx = max(2, int(round(footprint_length / bay_spacing)) + 1)
     ny = max(2, int(round(footprint_width / bay_spacing)) + 1)
+    return nx, ny
+
+
+def estimate_column_count(footprint_length, footprint_width, bay_spacing=DEFAULT_BAY_SPACING_M):
+    """Total number of vertical columns on the bay grid (``nx * ny``)."""
+    nx, ny = column_grid(footprint_length, footprint_width, bay_spacing)
     return nx * ny
 
 
@@ -192,3 +199,331 @@ def assemble_shear_stiffness_matrix(story_stiffness_array):
             K[j, j + 1] -= k[j + 1]
             K[j + 1, j] -= k[j + 1]
     return K
+
+
+# ---------------------------------------------------------------------------
+# Unified shear + flexural stiffness (Timoshenko cantilever)
+# ---------------------------------------------------------------------------
+#
+# A pure shear building (above) captures racking but not the overall cantilever
+# bending that makes tall, wall/core buildings sway in a flexural shape. Real
+# structures do both, and the two deformations add in *series* (tip compliance =
+# bending compliance + shear compliance), not in parallel. The clean way to get
+# that coupling exactly right is a Timoshenko beam element, which carries both a
+# flexural rigidity ``EI`` and a shear rigidity ``GA_s`` and reduces to the pure
+# bending (Euler-Bernoulli) or pure shear limit as one rigidity dominates.
+#
+# We stack one element per story, fix the base, and statically condense out the
+# floor rotations so the model stays at one lateral DOF per floor.
+
+def timoshenko_story_element(EI, GA_s, length):
+    """4x4 Timoshenko beam-element stiffness, DOF order ``[v1, th1, v2, th2]``.
+
+    ``EI`` is flexural rigidity (N.m^2), ``GA_s`` the shear rigidity (N), and
+    ``length`` the element length (m). The shear-deformation parameter
+    ``phi = 12 EI / (GA_s L^2)`` blends the behaviour: ``phi -> 0`` gives the
+    Euler-Bernoulli (pure bending) element, ``phi -> inf`` a pure shear spring.
+    """
+    L = length
+    phi = 12.0 * EI / (GA_s * L * L)
+    c = EI / ((1.0 + phi) * L ** 3)
+    L2 = L * L
+    return c * np.array([
+        [12.0,        6.0 * L,          -12.0,       6.0 * L],
+        [6.0 * L,     (4.0 + phi) * L2, -6.0 * L,    (2.0 - phi) * L2],
+        [-12.0,       -6.0 * L,         12.0,        -6.0 * L],
+        [6.0 * L,     (2.0 - phi) * L2, -6.0 * L,    (4.0 + phi) * L2],
+    ])
+
+
+def assemble_shear_flexural_stiffness(EI, GA_s, story_height, num_stories):
+    """Lateral stiffness (N/m, ``N x N``) of a Timoshenko cantilever.
+
+    ``EI`` and ``GA_s`` may be scalars (uniform over height) or length-``N``
+    arrays (per story). The base is fixed; floor rotations are statically
+    condensed out so the result is in terms of the ``N`` floor lateral
+    displacements only.
+    """
+    n = num_stories
+    EI = np.broadcast_to(np.asarray(EI, dtype=float), (n,))
+    GA_s = np.broadcast_to(np.asarray(GA_s, dtype=float), (n,))
+    h = np.broadcast_to(np.asarray(story_height, dtype=float), (n,))
+
+    # Global node DOFs: node 0 = base, nodes 1..N = floors; each node [v, theta].
+    ndof = 2 * (n + 1)
+    Kg = np.zeros((ndof, ndof), dtype=float)
+    for e in range(1, n + 1):  # element e connects node e-1 to node e
+        ke = timoshenko_story_element(EI[e - 1], GA_s[e - 1], h[e - 1])
+        dofs = [2 * (e - 1), 2 * (e - 1) + 1, 2 * e, 2 * e + 1]
+        Kg[np.ix_(dofs, dofs)] += ke
+
+    # Drop the fixed base node (DOFs 0, 1).
+    free = np.arange(2, ndof)
+    Kf = Kg[np.ix_(free, free)]
+
+    # Partition into translational (even) and rotational (odd) DOFs, condense.
+    trans = np.arange(0, 2 * n, 2)
+    rot = np.arange(1, 2 * n, 2)
+    Kvv = Kf[np.ix_(trans, trans)]
+    Kvr = Kf[np.ix_(trans, rot)]
+    Krv = Kf[np.ix_(rot, trans)]
+    Krr = Kf[np.ix_(rot, rot)]
+    K_condensed = Kvv - Kvr @ np.linalg.solve(Krr, Krv)
+    # Symmetrise to clean up any round-off from the condensation.
+    return 0.5 * (K_condensed + K_condensed.T)
+
+
+def _system_rigidity_factors(structural_system):
+    """(shear, flexural) rigidity multipliers for a structural system type.
+
+    These multiply the column-derived baselines (racking shear and chord-action
+    bending), expressing how much extra lateral rigidity a system's bracing /
+    walls / core contribute. They are conceptual-design calibration factors, not
+    measured constants: moment frames are shear-dominated (1, 1); braced frames
+    stiffen shear; shear-wall / core / diagrid systems add large flexural
+    rigidity so they sway in a cantilever (bending) shape.
+    """
+    from core.building_structure import StructuralSystemType as S
+
+    factors = {
+        S.FRAME_MOMENT_RESISTING:   (1.0, 1.0),
+        S.FRAME_BRACED_CONCENTRIC:  (4.0, 3.0),
+        S.FRAME_BRACED_ECCENTRIC:   (3.0, 2.5),
+        S.SHEAR_WALLS:              (3.0, 40.0),
+        S.CORE_WALL:                (2.0, 60.0),
+        S.DIAGRID:                  (5.0, 50.0),
+    }
+    return factors.get(structural_system, (1.0, 1.0))
+
+
+def flexural_inertia(building):
+    """Effective second moment of area for cantilever bending (m^4).
+
+    Column chord action: each column line at distance ``d`` from the plan
+    centroid contributes ``A_col * d^2`` (parallel-axis term), summed across the
+    grid. This is the bending rigidity source for a bare frame; wall/core systems
+    scale it up via their flexural factor.
+    """
+    nx, ny = column_grid(building.footprint_length, building.footprint_width)
+    area, _inertia = column_section(building)
+    xs = np.linspace(-building.footprint_length / 2.0, building.footprint_length / 2.0, nx)
+    return ny * area * float(np.sum(xs ** 2))
+
+
+def shear_rigidity(building):
+    """Story shear rigidity ``GA_s`` (N), including the system shear factor.
+
+    Derived from the column racking stiffness of step 1: a story shear spring
+    ``k`` corresponds to ``GA_s = k * h`` for an element of length ``h``.
+    """
+    h = building.story_height
+    k_story = story_shear_stiffness(building)
+    shear_mult, _ = _system_rigidity_factors(building.structural_system)
+    return k_story * h * shear_mult
+
+
+def flexural_rigidity(building):
+    """Building flexural rigidity ``EI`` (N.m^2), including the system factor."""
+    e_mod = building.primary_material.elastic_modulus
+    _, flex_mult = _system_rigidity_factors(building.structural_system)
+    return e_mod * flexural_inertia(building) * flex_mult
+
+
+def structural_stiffness_matrix(building):
+    """Unified shear+flexural lateral stiffness for a building (``N x N``)."""
+    return assemble_shear_flexural_stiffness(
+        EI=flexural_rigidity(building),
+        GA_s=shear_rigidity(building),
+        story_height=building.story_height,
+        num_stories=building.num_stories,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Modal analysis
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ModalResult:
+    """Result of a free-vibration eigen-analysis, modes sorted by frequency.
+
+    ``frequencies`` are circular (rad/s), ``periods`` in seconds. ``mode_shapes``
+    holds one mode per column, mass-normalised so ``Phi^T M Phi = I`` (hence
+    ``Phi^T K Phi = diag(omega^2)``). ``participation`` is the modal participation
+    factor for the given influence vector and ``effective_mass`` its square (the
+    effective modal mass), which sums to the total mass.
+    """
+    frequencies: np.ndarray
+    periods: np.ndarray
+    mode_shapes: np.ndarray
+    participation: np.ndarray
+    effective_mass: np.ndarray
+
+
+def modal_analysis(M, K, influence=None):
+    """Solve the generalised eigenproblem ``K phi = omega^2 M phi``.
+
+    ``M`` is the (diagonal, positive) mass matrix and ``K`` the stiffness matrix.
+    The problem is reduced to the symmetric standard form
+    ``A = M^-1/2 K M^-1/2`` and solved with ``eigh`` for numerical robustness.
+    ``influence`` is the rigid-body displacement vector for unit ground motion
+    (defaults to all-ones, i.e. uniform horizontal base motion).
+    """
+    M = np.asarray(M, dtype=float)
+    K = np.asarray(K, dtype=float)
+    masses = np.diag(M)
+    inv_sqrt = 1.0 / np.sqrt(masses)
+
+    A = inv_sqrt[:, None] * K * inv_sqrt[None, :]
+    A = 0.5 * (A + A.T)  # enforce symmetry before eigh
+    eigvals, psi = np.linalg.eigh(A)
+
+    eigvals = np.clip(eigvals, 0.0, None)  # guard tiny negative round-off
+    order = np.argsort(eigvals)
+    eigvals = eigvals[order]
+    psi = psi[:, order]
+
+    omega = np.sqrt(eigvals)
+    periods = np.where(omega > 0.0, 2.0 * np.pi / np.maximum(omega, 1e-30), np.inf)
+
+    # Recover mass-normalised mode shapes and fix sign (largest |component| > 0).
+    phi = inv_sqrt[:, None] * psi
+    for j in range(phi.shape[1]):
+        if phi[np.argmax(np.abs(phi[:, j])), j] < 0:
+            phi[:, j] *= -1.0
+
+    n = M.shape[0]
+    r = np.ones(n) if influence is None else np.asarray(influence, dtype=float)
+    participation = phi.T @ (M @ r)
+
+    return ModalResult(omega, periods, phi, participation, participation ** 2)
+
+
+def building_modal_analysis(building):
+    """Convenience: modal analysis from a building's mass and stiffness."""
+    M = assemble_mass_matrix(floor_masses(building))
+    K = structural_stiffness_matrix(building)
+    return modal_analysis(M, K)
+
+
+# ---------------------------------------------------------------------------
+# Rayleigh (proportional) damping
+# ---------------------------------------------------------------------------
+
+def rayleigh_coefficients(zeta_i, omega_i, omega_j, zeta_j=None):
+    """Mass/stiffness proportional coefficients ``(alpha, beta)``.
+
+    Chosen so ``C = alpha M + beta K`` yields damping ratio ``zeta_i`` at
+    frequency ``omega_i`` and ``zeta_j`` at ``omega_j`` (``zeta_j`` defaults to
+    ``zeta_i``). The modal damping of such a system is
+    ``zeta(omega) = alpha/(2 omega) + beta omega/2``.
+    """
+    if zeta_j is None:
+        zeta_j = zeta_i
+    a = np.array([[1.0 / (2.0 * omega_i), omega_i / 2.0],
+                  [1.0 / (2.0 * omega_j), omega_j / 2.0]])
+    alpha, beta = np.linalg.solve(a, np.array([zeta_i, zeta_j]))
+    return float(alpha), float(beta)
+
+
+def rayleigh_damping(M, K, zeta, omega_i, omega_j, zeta_j=None):
+    """Rayleigh damping matrix ``C = alpha M + beta K`` (see coefficients)."""
+    alpha, beta = rayleigh_coefficients(zeta, omega_i, omega_j, zeta_j)
+    return alpha * np.asarray(M, dtype=float) + beta * np.asarray(K, dtype=float)
+
+
+def damping_matrix(building, M, K, modal=None, anchor_modes=(1, 3)):
+    """Rayleigh damping for a building, anchored at two of its modes.
+
+    The target ratio is the building's ``effective_damping_ratio``, applied at
+    the two ``anchor_modes`` (1-based; clamped to the available modes). A single
+    mode degenerates to mass-proportional damping that hits the target exactly.
+    """
+    if modal is None:
+        modal = modal_analysis(M, K)
+    n = len(modal.frequencies)
+    zeta = building.effective_damping_ratio
+
+    i = min(anchor_modes[0], n) - 1
+    j = min(anchor_modes[1], n) - 1
+    if i == j:
+        # Single available mode: C = 2 zeta omega M reproduces zeta at that mode.
+        return 2.0 * zeta * modal.frequencies[i] * np.asarray(M, dtype=float)
+    return rayleigh_damping(M, K, zeta, modal.frequencies[i], modal.frequencies[j])
+
+
+# ---------------------------------------------------------------------------
+# Time integration (Newmark-beta)
+# ---------------------------------------------------------------------------
+
+class NewmarkIntegrator:
+    """Newmark-beta direct time integrator for ``M u'' + C u' + K u = F(t)``.
+
+    Defaults to the *average-acceleration* (constant-average-acceleration)
+    scheme (gamma=1/2, beta=1/4), which is unconditionally stable and
+    second-order accurate -- the standard choice in earthquake engineering. It
+    does not suffer the amplitude blow-up that an explicit scheme would on the
+    stiff upper modes at a 1/60 s frame step.
+
+    The effective stiffness is constant while the structure is linear, so it is
+    inverted once up front and reused every step. Call :meth:`update_system`
+    when the stiffness or damping changes (e.g. a story fails or the soil
+    softens) to refactorise.
+    """
+
+    def __init__(self, M, C, K, dt, gamma=0.5, beta=0.25):
+        self.M = np.asarray(M, dtype=float)
+        self.C = np.asarray(C, dtype=float)
+        self.K = np.asarray(K, dtype=float)
+        self.dt = float(dt)
+        self.gamma = float(gamma)
+        self.beta = float(beta)
+        self._build()
+
+    def _build(self):
+        dt, beta, gamma = self.dt, self.beta, self.gamma
+        # Integration constants (Newmark, e.g. Chopra "Dynamics of Structures").
+        self.c0 = 1.0 / (beta * dt * dt)
+        self.c1 = gamma / (beta * dt)
+        self.c2 = 1.0 / (beta * dt)
+        self.c3 = 1.0 / (2.0 * beta) - 1.0
+        self.c4 = gamma / beta - 1.0
+        self.c5 = dt * (gamma / (2.0 * beta) - 1.0)
+        self.c6 = dt * (1.0 - gamma)
+        self.c7 = dt * gamma
+
+        K_eff = self.K + self.c0 * self.M + self.c1 * self.C
+        self._K_eff_inv = np.linalg.inv(K_eff)
+
+    def update_system(self, K=None, C=None):
+        """Replace the stiffness and/or damping matrices and refactorise."""
+        if K is not None:
+            self.K = np.asarray(K, dtype=float)
+        if C is not None:
+            self.C = np.asarray(C, dtype=float)
+        self._build()
+
+    def initial_acceleration(self, u, v, F):
+        """Acceleration consistent with the equation of motion at t=0."""
+        u = np.asarray(u, dtype=float)
+        v = np.asarray(v, dtype=float)
+        F = np.asarray(F, dtype=float)
+        return np.linalg.solve(self.M, F - self.C @ v - self.K @ u)
+
+    def step(self, u, v, a, F_next):
+        """Advance one step. Returns the new ``(u, v, a)`` at ``t + dt``.
+
+        ``F_next`` is the external force vector at the end of the step.
+        """
+        u = np.asarray(u, dtype=float)
+        v = np.asarray(v, dtype=float)
+        a = np.asarray(a, dtype=float)
+        F_next = np.asarray(F_next, dtype=float)
+
+        F_eff = (F_next
+                 + self.M @ (self.c0 * u + self.c2 * v + self.c3 * a)
+                 + self.C @ (self.c1 * u + self.c4 * v + self.c5 * a))
+        u_next = self._K_eff_inv @ F_eff
+        a_next = self.c0 * (u_next - u) - self.c2 * v - self.c3 * a
+        v_next = v + self.c6 * a + self.c7 * a_next
+        return u_next, v_next, a_next

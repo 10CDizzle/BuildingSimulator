@@ -13,7 +13,9 @@ import unittest
 import numpy as np
 
 from core import physics
-from core.building_structure import Building, CONCRETE, STEEL, MassDistribution
+from core.building_structure import (
+    Building, CONCRETE, STEEL, MassDistribution, StructuralSystemType,
+)
 
 
 def uniform_shear_building_frequencies(n, k, m):
@@ -151,6 +153,266 @@ class BuildingDerivationTests(unittest.TestCase):
         )[0]
         period = 2.0 * math.pi / omega1
         self.assertTrue(0.2 < period < 1.5, f"fundamental period {period:.3f}s out of band")
+
+
+class ShearFlexuralStiffnessTests(unittest.TestCase):
+    """Unified Timoshenko cantilever: limits and the exact coupling."""
+
+    def test_coupled_tip_deflection_is_series_of_bending_and_shear(self):
+        """Tip deflection under a unit roof load = H^3/(3EI) + H/(GA_s).
+
+        This is the exact Timoshenko cantilever result and simultaneously
+        exercises the element, assembly, base fixity, and rotation condensation.
+        """
+        EI, GA_s, h, n = 5.0e11, 3.0e8, 3.0, 8
+        H = n * h
+        K = physics.assemble_shear_flexural_stiffness(EI, GA_s, h, n)
+        F = np.zeros(n)
+        F[-1] = 1.0  # unit load at the roof
+        u = np.linalg.solve(K, F)
+        expected_tip = H ** 3 / (3.0 * EI) + H / GA_s
+        self.assertAlmostEqual(u[-1], expected_tip, delta=expected_tip * 1e-9)
+
+    def test_pure_flexural_single_story_tip_stiffness(self):
+        """With negligible shear flexibility, a 1-element cantilever -> 3EI/L^3."""
+        EI, h = 2.0e11, 3.0
+        GA_s = 1.0e18  # effectively rigid in shear
+        K = physics.assemble_shear_flexural_stiffness(EI, GA_s, h, 1)
+        self.assertAlmostEqual(K[0, 0], 3.0 * EI / h ** 3, delta=3.0 * EI / h ** 3 * 1e-6)
+
+    def test_pure_shear_limit_matches_shear_building(self):
+        """With dominant bending rigidity, the matrix -> the shear building K."""
+        GA_s, h, n = 2.5e8, 3.0, 6
+        EI = 1.0e18  # effectively rigid in bending -> pure shear
+        K_tim = physics.assemble_shear_flexural_stiffness(EI, GA_s, h, n)
+        K_shear = physics.assemble_shear_stiffness_matrix(np.full(n, GA_s / h))
+        np.testing.assert_allclose(K_tim, K_shear, rtol=1e-6, atol=1.0)
+
+    def test_matrix_is_symmetric_and_positive_definite(self):
+        K = physics.assemble_shear_flexural_stiffness(4.0e11, 3.0e8, 3.0, 5)
+        np.testing.assert_allclose(K, K.T, rtol=0, atol=1e-3)
+        self.assertTrue(np.all(np.linalg.eigvalsh(K) > 0.0))
+
+    def test_added_shear_flexibility_softens_structure(self):
+        """Finite shear rigidity must make a frame more flexible than pure bending."""
+        EI, GA_s, h, n = 5.0e11, 3.0e8, 3.0, 8
+        K_coupled = physics.assemble_shear_flexural_stiffness(EI, GA_s, h, n)
+        K_bending = physics.assemble_shear_flexural_stiffness(EI, 1.0e18, h, n)
+        F = np.zeros(n)
+        F[-1] = 1.0
+        tip_coupled = np.linalg.solve(K_coupled, F)[-1]
+        tip_bending = np.linalg.solve(K_bending, F)[-1]
+        self.assertGreater(tip_coupled, tip_bending)
+
+
+class StructuralSystemTests(unittest.TestCase):
+    def _building(self, system):
+        return Building(num_stories=12, story_height=3.0, footprint_length=20.0,
+                        footprint_width=15.0, primary_material=CONCRETE,
+                        structural_system=system)
+
+    def _fundamental_period(self, b):
+        M = physics.assemble_mass_matrix(physics.floor_masses(b))
+        K = physics.structural_stiffness_matrix(b)
+        omega1 = natural_frequencies(M, K)[0]
+        return 2.0 * math.pi / omega1
+
+    def test_core_wall_stiffer_than_moment_frame(self):
+        """Flexural-dominated systems should sway less (shorter period)."""
+        frame = self._building(StructuralSystemType.FRAME_MOMENT_RESISTING)
+        core = self._building(StructuralSystemType.CORE_WALL)
+        self.assertLess(self._fundamental_period(core), self._fundamental_period(frame))
+
+    def test_braced_frame_stiffer_than_moment_frame(self):
+        frame = self._building(StructuralSystemType.FRAME_MOMENT_RESISTING)
+        braced = self._building(StructuralSystemType.FRAME_BRACED_CONCENTRIC)
+        self.assertLess(self._fundamental_period(braced), self._fundamental_period(frame))
+
+    def test_structural_matrix_well_formed(self):
+        b = self._building(StructuralSystemType.SHEAR_WALLS)
+        K = physics.structural_stiffness_matrix(b)
+        self.assertEqual(K.shape, (b.num_stories, b.num_stories))
+        np.testing.assert_allclose(K, K.T, rtol=0, atol=K.max() * 1e-9)
+        self.assertTrue(np.all(np.linalg.eigvalsh(K) > 0.0))
+
+
+class ModalAnalysisTests(unittest.TestCase):
+    """Eigen-analysis against a hand-solvable 2-DOF system."""
+
+    def setUp(self):
+        # m = k = 1; K is the 2-story shear building matrix.
+        self.M = np.eye(2)
+        self.K = np.array([[2.0, -1.0], [-1.0, 1.0]])
+        # Exact: omega^2 = (3 -+ sqrt 5)/2.
+        self.exact_omega = np.sqrt(np.sort([(3 - math.sqrt(5)) / 2, (3 + math.sqrt(5)) / 2]))
+
+    def test_frequencies_match_hand_solution(self):
+        res = physics.modal_analysis(self.M, self.K)
+        np.testing.assert_allclose(res.frequencies, self.exact_omega, rtol=1e-12)
+
+    def test_periods_are_two_pi_over_omega(self):
+        res = physics.modal_analysis(self.M, self.K)
+        np.testing.assert_allclose(res.periods, 2.0 * math.pi / res.frequencies, rtol=1e-12)
+
+    def test_mode_shapes_are_mass_and_stiffness_orthonormal(self):
+        res = physics.modal_analysis(self.M, self.K)
+        phi = res.mode_shapes
+        np.testing.assert_allclose(phi.T @ self.M @ phi, np.eye(2), atol=1e-12)
+        np.testing.assert_allclose(phi.T @ self.K @ phi,
+                                   np.diag(res.frequencies ** 2), atol=1e-12)
+
+    def test_effective_modal_mass_sums_to_total_mass(self):
+        res = physics.modal_analysis(self.M, self.K)
+        self.assertAlmostEqual(float(np.sum(res.effective_mass)),
+                               float(np.sum(np.diag(self.M))), places=10)
+
+    def test_building_modal_first_period_matches_direct_solve(self):
+        b = Building(num_stories=8, story_height=3.0, footprint_length=18.0,
+                     footprint_width=14.0, primary_material=CONCRETE)
+        res = physics.building_modal_analysis(b)
+        direct = natural_frequencies(physics.assemble_mass_matrix(physics.floor_masses(b)),
+                                     physics.structural_stiffness_matrix(b))
+        np.testing.assert_allclose(res.frequencies, direct, rtol=1e-10)
+        # Fundamental mode shape should grow monotonically up the height.
+        first = res.mode_shapes[:, 0]
+        self.assertTrue(np.all(np.diff(np.abs(first)) > 0))
+
+
+class RayleighDampingTests(unittest.TestCase):
+    def test_coefficients_match_equal_zeta_closed_form(self):
+        zeta, wi, wj = 0.05, 2.0, 9.0
+        alpha, beta = physics.rayleigh_coefficients(zeta, wi, wj)
+        self.assertAlmostEqual(alpha, zeta * 2 * wi * wj / (wi + wj), places=12)
+        self.assertAlmostEqual(beta, zeta * 2 / (wi + wj), places=12)
+
+    def test_damping_reproduces_target_ratio_at_anchor_modes(self):
+        M = np.diag([1500.0, 1500.0, 1500.0])
+        K = physics.assemble_shear_stiffness_matrix(np.full(3, 4.0e6))
+        res = physics.modal_analysis(M, K)
+        zeta = 0.05
+        wi, wj = res.frequencies[0], res.frequencies[2]
+        C = physics.rayleigh_damping(M, K, zeta, wi, wj)
+        phi = res.mode_shapes
+        # Modal damping ratio for mass-normalised modes: zeta_k = phi^T C phi / (2 omega_k).
+        for idx in (0, 2):
+            modal_c = phi[:, idx] @ C @ phi[:, idx]
+            zeta_k = modal_c / (2.0 * res.frequencies[idx])
+            self.assertAlmostEqual(zeta_k, zeta, places=10)
+
+    def test_intermediate_mode_is_underdamped_relative_to_anchors(self):
+        M = np.diag([1500.0, 1500.0, 1500.0])
+        K = physics.assemble_shear_stiffness_matrix(np.full(3, 4.0e6))
+        res = physics.modal_analysis(M, K)
+        zeta = 0.05
+        C = physics.rayleigh_damping(M, K, zeta, res.frequencies[0], res.frequencies[2])
+        phi = res.mode_shapes
+        zeta_mid = (phi[:, 1] @ C @ phi[:, 1]) / (2.0 * res.frequencies[1])
+        # Rayleigh damping dips between the two anchor frequencies.
+        self.assertTrue(0.0 < zeta_mid < zeta)
+
+    def test_building_damping_matrix_is_symmetric(self):
+        b = Building(num_stories=6, story_height=3.0, footprint_length=15.0,
+                     footprint_width=10.0, primary_material=CONCRETE)
+        M = physics.assemble_mass_matrix(physics.floor_masses(b))
+        K = physics.structural_stiffness_matrix(b)
+        C = physics.damping_matrix(b, M, K)
+        np.testing.assert_allclose(C, C.T, rtol=0, atol=C.max() * 1e-12)
+
+
+class NewmarkIntegratorTests(unittest.TestCase):
+    """Time integration against analytical single- and multi-DOF results."""
+
+    def test_sdof_damped_free_vibration_matches_analytical(self):
+        m, k, zeta = 2.0, 800.0, 0.05
+        omega = math.sqrt(k / m)
+        c = 2.0 * zeta * omega * m
+        omega_d = omega * math.sqrt(1.0 - zeta ** 2)
+
+        M, C, K = np.array([[m]]), np.array([[c]]), np.array([[k]])
+        dt = (2 * math.pi / omega) / 400.0  # ~400 steps per period
+        integ = physics.NewmarkIntegrator(M, C, K, dt)
+
+        u = np.array([1.0]); v = np.array([0.0])
+        a = integ.initial_acceleration(u, v, np.zeros(1))
+
+        def analytical(t):
+            return math.exp(-zeta * omega * t) * (
+                math.cos(omega_d * t) + (zeta * omega / omega_d) * math.sin(omega_d * t))
+
+        t = 0.0
+        for _ in range(1200):
+            u, v, a = integ.step(u, v, a, np.zeros(1))
+            t += dt
+            self.assertAlmostEqual(u[0], analytical(t), delta=2e-3)
+
+    def test_undamped_energy_is_conserved_over_long_run(self):
+        """Average-acceleration Newmark must not pump or bleed energy."""
+        m, k = 1.5, 1200.0
+        M, C, K = np.array([[m]]), np.array([[0.0]]), np.array([[k]])
+        omega = math.sqrt(k / m)
+        dt = (2 * math.pi / omega) / 60.0
+        integ = physics.NewmarkIntegrator(M, C, K, dt)
+
+        u = np.array([0.05]); v = np.array([0.0])
+        a = integ.initial_acceleration(u, v, np.zeros(1))
+        e0 = 0.5 * m * v[0] ** 2 + 0.5 * k * u[0] ** 2
+
+        for _ in range(60 * 200):  # 200 periods
+            u, v, a = integ.step(u, v, a, np.zeros(1))
+            e = 0.5 * m * v[0] ** 2 + 0.5 * k * u[0] ** 2
+            self.assertLess(abs(e - e0) / e0, 1e-3)
+
+    def test_constant_load_converges_to_static_solution(self):
+        M = np.diag([1000.0, 1000.0, 1000.0])
+        K = physics.assemble_shear_stiffness_matrix(np.full(3, 5.0e5))
+        res = physics.modal_analysis(M, K)
+        C = physics.rayleigh_damping(M, K, 0.1, res.frequencies[0], res.frequencies[2])
+        dt = res.periods[0] / 50.0
+        integ = physics.NewmarkIntegrator(M, C, K, dt)
+
+        F = np.array([1000.0, 2000.0, 1500.0])
+        u = np.zeros(3); v = np.zeros(3); a = integ.initial_acceleration(u, v, F)
+        for _ in range(5000):
+            u, v, a = integ.step(u, v, a, F)
+        np.testing.assert_allclose(u, np.linalg.solve(K, F), rtol=1e-4)
+
+    def test_update_system_refactorises(self):
+        M = np.diag([1000.0, 1000.0])
+        K1 = physics.assemble_shear_stiffness_matrix(np.full(2, 4.0e5))
+        K2 = physics.assemble_shear_stiffness_matrix(np.full(2, 1.0e5))  # softened
+        C = np.zeros((2, 2))
+        integ = physics.NewmarkIntegrator(M, np.diag([2e4, 2e4]), K1, 0.01)
+
+        F = np.array([500.0, 800.0])
+        integ.update_system(K=K2)
+        u = np.zeros(2); v = np.zeros(2); a = integ.initial_acceleration(u, v, F)
+        for _ in range(8000):
+            u, v, a = integ.step(u, v, a, F)
+        np.testing.assert_allclose(u, np.linalg.solve(K2, F), rtol=1e-3)
+
+    def test_resonant_forcing_amplifies(self):
+        """Harmonic forcing at the natural frequency should build a large response."""
+        m, k, zeta = 1.0, 400.0, 0.02
+        omega = math.sqrt(k / m)
+        c = 2 * zeta * omega * m
+        M, C, K = np.array([[m]]), np.array([[c]]), np.array([[k]])
+        dt = (2 * math.pi / omega) / 200.0
+        integ = physics.NewmarkIntegrator(M, C, K, dt)
+
+        u = np.zeros(1); v = np.zeros(1); a = np.zeros(1)
+        peak_on, peak_off = 0.0, 0.0
+        t = 0.0
+        for _ in range(200 * 40):
+            t += dt
+            u, v, a = integ.step(u, v, a, np.array([math.sin(omega * t)]))
+            peak_on = max(peak_on, abs(u[0]))
+        # Re-run far above resonance: response stays near quasi-static.
+        u = np.zeros(1); v = np.zeros(1); a = np.zeros(1); t = 0.0
+        for _ in range(200 * 40):
+            t += dt
+            u, v, a = integ.step(u, v, a, np.array([math.sin(5 * omega * t)]))
+            peak_off = max(peak_off, abs(u[0]))
+        self.assertGreater(peak_on, 5 * peak_off)
 
 
 if __name__ == "__main__":
