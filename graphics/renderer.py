@@ -390,53 +390,60 @@ class Renderer:
     # -- Building -----------------------------------------------------------
 
     def render_building(self, building, x_center_screen, biome_code, liquefaction_effect_scale=0.0):
-        building_width_pixels = building.footprint_length * settings.METERS_TO_PIXELS
-        building_height_pixels = building.total_height * settings.METERS_TO_PIXELS
-        story_height_pixels = building.story_height * settings.METERS_TO_PIXELS
+        """Draw the building as a per-story deformed stack following the model.
 
-        building_x_left = x_center_screen - building_width_pixels / 2
-        building_x_right = x_center_screen + building_width_pixels / 2
+        Each floor level is offset horizontally by the model's lateral
+        displacement there (foundation sway + rocking + structural distortion),
+        so the rendered shape is the actual mode/response profile -- straight
+        sway, soft-story kinks, and base translation all show up.
+        """
+        M2P = settings.METERS_TO_PIXELS
+        n = building.num_stories
+        width_px = building.footprint_length * M2P
+        story_px = building.story_height * M2P
+        x_left = x_center_screen - width_px / 2
+        x_right = x_center_screen + width_px / 2
 
-        ground_y_left = self.biome_generator.get_ground_y_at_x(building_x_left, biome_code, liquefaction_effect_scale)
-        ground_y_right = self.biome_generator.get_ground_y_at_x(building_x_right, biome_code, liquefaction_effect_scale)
+        # Level foundation: base both columns on the ground height at the centre so
+        # the building stands vertical and only the model's deformation tilts it.
+        base_y = self.biome_generator.get_ground_y_at_x(x_center_screen, biome_code, liquefaction_effect_scale)
 
-        max_angle_rad = math.radians(30)
-        angle_rad = max(-max_angle_rad, min(max_angle_rad, building.angular_displacement_rad))
-        top_shear_dx = building_height_pixels * math.tan(angle_rad)
+        # Horizontal pixel offset at each floor level k = 0 (base) .. n (roof).
+        disp = building.floor_displacements()  # metres, floors 1..n
+        offsets = [building.base_sway * M2P] + [float(d) * M2P for d in disp]
+        failed = building.collapse.failed
 
-        base_left = (building_x_left, ground_y_left)
-        base_right = (building_x_right, ground_y_right)
-        top_right = (building_x_right + top_shear_dx, ground_y_right - building_height_pixels)
-        top_left = (building_x_left + top_shear_dx, ground_y_left - building_height_pixels)
-        points = [base_left, base_right, top_right, top_left]
+        left_pts, right_pts = [], []
+        for k in range(n + 1):
+            y = base_y - story_px * k
+            left_pts.append((x_left + offsets[k], y))
+            right_pts.append((x_right + offsets[k], y))
 
-        # Ground contact shadow (soft ellipse) under the building.
-        self._draw_contact_shadow(x_center_screen, (ground_y_left + ground_y_right) / 2,
-                                  building_width_pixels)
+        self._draw_contact_shadow(x_center_screen + offsets[0], base_y, width_px)
 
-        # Shaded body: lighter at the top, darker at the base.
         body = settings.GRAY
-        gradient_polygon(self.screen, points, scale_color(body, 1.25), scale_color(body, 0.8))
+        polygon = left_pts + right_pts[::-1]
+        gradient_polygon(self.screen, polygon, scale_color(body, 1.25), scale_color(body, 0.8))
 
-        # Lit left edge highlight and shaded right edge for a sense of light.
-        pygame.draw.aaline(self.screen, scale_color(body, 1.5), base_left, top_left)
-        pygame.draw.aaline(self.screen, scale_color(body, 0.55), base_right, top_right)
+        # Highlight the lit (left) edge and shade the right edge.
+        pygame.draw.aalines(self.screen, scale_color(body, 1.5), False, left_pts)
+        pygame.draw.aalines(self.screen, scale_color(body, 0.55), False, right_pts)
 
-        # Floor slab lines across the facade.
-        for story_n in range(1, building.num_stories):
-            frac = story_n / building.num_stories
-            ly = (1 - frac)
-            left = (building_x_left + top_shear_dx * frac,
-                    ground_y_left - building_height_pixels * frac)
-            right = (building_x_right + top_shear_dx * frac,
-                     ground_y_right - building_height_pixels * frac)
-            pygame.draw.aaline(self.screen, scale_color(body, 0.6), left, right)
+        # Mark hinged/failed stories with a translucent red overlay.
+        for s in range(n):
+            if failed[s]:
+                quad = [left_pts[s], right_pts[s], right_pts[s + 1], left_pts[s + 1]]
+                layer = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+                aa_polygon(layer, quad, (200, 60, 50, 110))
+                self.screen.blit(layer, (0, 0))
 
-        self._draw_windows(building, building_x_left, building_width_pixels,
-                           ground_y_left, ground_y_right, story_height_pixels, angle_rad)
+        # Floor slab lines.
+        for k in range(n + 1):
+            pygame.draw.aaline(self.screen, scale_color(body, 0.6), left_pts[k], right_pts[k])
 
-        # Crisp anti-aliased outline.
-        gfxdraw.aapolygon(self.screen, [(int(round(x)), int(round(y))) for x, y in points],
+        self._draw_windows(building, left_pts, right_pts, story_px)
+
+        gfxdraw.aapolygon(self.screen, [(int(round(x)), int(round(y))) for x, y in polygon],
                           scale_color(body, 0.4))
 
     def _draw_contact_shadow(self, x_center, ground_y, width):
@@ -445,33 +452,32 @@ class Renderer:
                                int(width * 0.7), 14, (0, 0, 0, 90))
         self.screen.blit(shadow, (x_center - shadow.get_width() // 2, ground_y - 12))
 
-    def _draw_windows(self, building, building_x_left, building_width_pixels,
-                      ground_y_left, ground_y_right, story_height_pixels, angle_rad):
-        num_windows = max(1, int(building.footprint_length / 5))
-        window_width = story_height_pixels * 0.3
-        window_height = story_height_pixels * 0.5
-        window_margin_vertical = (story_height_pixels - window_height) / 2
+    @staticmethod
+    def _lerp_point(a, b, t):
+        return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
 
-        # Deterministic "lit" pattern per building so it doesn't flicker.
+    def _draw_windows(self, building, left_pts, right_pts, story_px):
+        n = building.num_stories
+        num_windows = max(1, int(building.footprint_length / 5))
+        window_width = story_px * 0.3
+        window_height = story_px * 0.5
+
         rng = random.Random(building.num_stories * 131 + int(building.footprint_length))
         lit_warm = (255, 224, 150)
         glass_top = (200, 228, 240)
         glass_bottom = (120, 165, 195)
 
-        for story_n in range(building.num_stories):
-            story_base_y_left = ground_y_left - (story_n * story_height_pixels)
-            story_base_y_right = ground_y_right - (story_n * story_height_pixels)
+        for s in range(n):
+            bottom_l, bottom_r = left_pts[s], right_pts[s]
+            top_l, top_r = left_pts[s + 1], right_pts[s + 1]
             for i in range(num_windows):
-                win_x_offset = (i + 0.5) * (building_width_pixels / num_windows)
-                original_center_x = building_x_left + win_x_offset
-                slope_ratio = win_x_offset / building_width_pixels if building_width_pixels > 0 else 0
-                win_base_y = story_base_y_left * (1 - slope_ratio) + story_base_y_right * slope_ratio
-                win_top_y = win_base_y - story_height_pixels + window_margin_vertical
-
-                center_height = (story_n + 0.5) * story_height_pixels
-                shear_dx = center_height * math.tan(angle_rad)
-                cx = original_center_x + shear_dx
-                rect = pygame.Rect(cx - window_width / 2, win_top_y, window_width, window_height)
+                frac = (i + 0.5) / num_windows
+                bottom = self._lerp_point(bottom_l, bottom_r, frac)
+                top = self._lerp_point(top_l, top_r, frac)
+                cx = (bottom[0] + top[0]) / 2
+                cy = (bottom[1] + top[1]) / 2
+                rect = pygame.Rect(cx - window_width / 2, cy - window_height / 2,
+                                   window_width, window_height)
 
                 if rng.random() < 0.28:
                     pygame.draw.rect(self.screen, lit_warm, rect)
@@ -483,7 +489,6 @@ class Renderer:
                     grad = vertical_gradient(max(1, int(rect.width)), max(1, int(rect.height)),
                                              glass_top, glass_bottom)
                     self.screen.blit(grad, rect.topleft)
-                    # Diagonal glass highlight.
                     pygame.draw.aaline(self.screen, (235, 245, 250),
                                        (rect.left + 2, rect.bottom - 3),
                                        (rect.left + rect.width * 0.55, rect.top + 2))

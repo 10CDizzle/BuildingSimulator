@@ -1,352 +1,381 @@
-import pygame
 import random
-import math # Import the math module
-from config import settings
-from graphics.renderer import Renderer, Cloud, BuildingFragment, WindParticle, RainParticle # Import RainParticle
-from core.biome_generator import BiomeGenerator # Import BiomeGenerator
-from core.building_structure import Building, CONCRETE # Import Building and an example material
+import pygame
 import pygame_gui
+
+from config import settings
+from graphics.renderer import Renderer, Cloud, WindParticle, RainParticle
+from core.biome_generator import BiomeGenerator
+from core import physics
+from core.building_structure import (
+    Building, CONCRETE, STEEL, WOOD, StructuralSystemType, MassDistribution,
+)
+
+# --- Option maps shared between the UI and the model ------------------------
+
+MATERIALS = {"Concrete": CONCRETE, "Steel": STEEL, "Wood": WOOD}
+SYSTEMS = {
+    "Moment Frame": StructuralSystemType.FRAME_MOMENT_RESISTING,
+    "Braced (Conc.)": StructuralSystemType.FRAME_BRACED_CONCENTRIC,
+    "Braced (Ecc.)": StructuralSystemType.FRAME_BRACED_ECCENTRIC,
+    "Shear Walls": StructuralSystemType.SHEAR_WALLS,
+    "Core Wall": StructuralSystemType.CORE_WALL,
+    "Diagrid": StructuralSystemType.DIAGRID,
+}
+SOILS = {
+    "Rock": physics.ROCK_SOIL,
+    "Firm": physics.FIRM_SOIL,
+    "Medium": physics.MEDIUM_SOIL,
+    "Soft": physics.SOFT_SOIL,
+}
+MOTIONS = ["Synthetic", "Harmonic"]
 
 
 def main():
     pygame.init()
-
     screen = pygame.display.set_mode((settings.SCREEN_WIDTH, settings.SCREEN_HEIGHT))
     pygame.display.set_caption("2D Building Simulator")
     clock = pygame.time.Clock()
+    info_font = pygame.font.SysFont("Consolas", 20)
+    small_font = pygame.font.SysFont("Consolas", 16)
 
-    # Instantiate BiomeGenerator
     biome_generator = BiomeGenerator(settings.SCREEN_WIDTH, settings.SCREEN_HEIGHT)
-    # Pass biome_generator to Renderer
     renderer = Renderer(screen, biome_generator)
+    ui = pygame_gui.UIManager((settings.SCREEN_WIDTH, settings.SCREEN_HEIGHT), 'config/theme.json')
 
-    # --- Pygame GUI Manager ---
-    ui_manager = pygame_gui.UIManager((settings.SCREEN_WIDTH, settings.SCREEN_HEIGHT), 'config/theme.json')
-    ui_margin = 20
-    slider_height = 30 # pygame_gui elements might have different preferred heights
-    slider_width = 220
-    label_height = 20
-    label_width = slider_width
+    W, H = settings.SCREEN_WIDTH, settings.SCREEN_HEIGHT
 
-    # Initial building parameters
-    initial_stories = 5
-    initial_story_h = 3.0
-    initial_length = 15.0
-    initial_width = 10.0
-    initial_wind_speed = 25.0 # m/s
+    # --- UI construction helpers -------------------------------------------
+    def label(x, y, w, text, container=None):
+        return pygame_gui.elements.UILabel(pygame.Rect((x, y), (w, 20)), text, manager=ui)
 
-    # --- Create UI Elements ---
-    # Stories Slider
-    pygame_gui.elements.UILabel(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 4 - ui_margin - label_height), (label_width, label_height)), text="Stories:", manager=ui_manager)
-    stories_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 4 - ui_margin), (slider_width, slider_height)), start_value=initial_stories, value_range=(1, 20), manager=ui_manager, object_id="#stories_slider")
-    # Story Height Slider
-    pygame_gui.elements.UILabel(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 3 - ui_margin - label_height), (label_width, label_height)), text="Story Height (m):", manager=ui_manager)
-    story_h_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 3 - ui_margin), (slider_width, slider_height)), start_value=initial_story_h, value_range=(2.0, 5.0), manager=ui_manager, object_id="#story_h_slider")
-    # Footprint Length Slider
-    pygame_gui.elements.UILabel(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 2 - ui_margin - label_height), (label_width, label_height)), text="Length (m):", manager=ui_manager)
-    length_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 2 - ui_margin), (slider_width, slider_height)), start_value=initial_length, value_range=(5.0, 50.0), manager=ui_manager, object_id="#length_slider")
-    # Footprint Width Slider
-    pygame_gui.elements.UILabel(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 1 - ui_margin - label_height), (label_width, label_height)), text="Width (m):", manager=ui_manager)
-    width_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((ui_margin, settings.SCREEN_HEIGHT - slider_height * 1 - ui_margin), (slider_width, slider_height)), start_value=initial_width, value_range=(5.0, 50.0), manager=ui_manager, object_id="#width_slider")
+    def slider(x, y, w, start, rng):
+        return pygame_gui.elements.UIHorizontalSlider(
+            pygame.Rect((x, y), (w, 22)), start_value=start, value_range=rng, manager=ui)
 
-    # Wind Speed Slider (placing it next to the button or above it)
-    pygame_gui.elements.UILabel(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 2 - ui_margin - label_height), (label_width, label_height)), text="Wind Speed (m/s):", manager=ui_manager)
-    wind_speed_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 2 - ui_margin), (slider_width, slider_height)), start_value=initial_wind_speed, value_range=(0.0, 80.0), manager=ui_manager, object_id="#wind_speed_slider")
+    def dropdown(x, y, w, options, start):
+        return pygame_gui.elements.UIDropDownMenu(options, start, pygame.Rect((x, y), (w, 26)), manager=ui)
 
-    # Event Button
-    action_button_width = 150
-    button_height = 40
-    simulate_wind_button = pygame_gui.elements.UIButton(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - action_button_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 1 - ui_margin), (action_button_width, button_height)), text='Simulate Wind', manager=ui_manager, object_id="#wind_button")
+    def button(x, y, w, text):
+        return pygame_gui.elements.UIButton(pygame.Rect((x, y), (w, 30)), text, manager=ui)
 
-    # Earthquake Intensity Slider
-    initial_earthquake_intensity = 0.2 # PGA in g (e.g., 0.2g)
-    pygame_gui.elements.UILabel(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 4 - ui_margin - label_height), (label_width, label_height)), text="Tremor Intensity (PGA g):", manager=ui_manager)
-    earthquake_intensity_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 4 - ui_margin), (slider_width, slider_height)), start_value=initial_earthquake_intensity, value_range=(0.0, 1.0), manager=ui_manager, object_id="#earthquake_intensity_slider")
-    # Earthquake Button
-    simulate_earthquake_button = pygame_gui.elements.UIButton(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - action_button_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 3 - ui_margin), (action_button_width, button_height)), text='Simulate Earthquake', manager=ui_manager, object_id="#earthquake_button")
+    # --- Left column: structure --------------------------------------------
+    lx, lw = 12, 210
+    y = 10
+    label(lx, y, lw, "— STRUCTURE —"); y += 22
+    label(lx, y, lw, "Stories"); y += 18
+    s_stories = slider(lx, y, lw, 8, (1, 18)); y += 26
+    label(lx, y, lw, "Story Height (m)"); y += 18
+    s_story_h = slider(lx, y, lw, 3.5, (2.5, 4.0)); y += 26
+    label(lx, y, lw, "Length (m)"); y += 18
+    s_length = slider(lx, y, lw, 22, (8, 50)); y += 26
+    label(lx, y, lw, "Width (m)"); y += 18
+    s_width = slider(lx, y, lw, 16, (8, 50)); y += 26
+    label(lx, y, lw, "Ductility"); y += 18
+    s_ductility = slider(lx, y, lw, 0.6, (0.0, 1.0)); y += 28
+    label(lx, y, lw, "Material"); y += 18
+    d_material = dropdown(lx, y, lw, list(MATERIALS), "Concrete"); y += 30
+    label(lx, y, lw, "System"); y += 18
+    d_system = dropdown(lx, y, lw, list(SYSTEMS), "Moment Frame"); y += 30
+    label(lx, y, lw, "Soil"); y += 18
+    d_soil = dropdown(lx, y, lw, list(SOILS), "Firm"); y += 30
 
-    # Rainfall Intensity Slider
-    initial_rainfall_intensity = 0.0 # mm/hr
-    pygame_gui.elements.UILabel(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 6 - ui_margin - label_height), (label_width, label_height)), text="Rainfall (mm/hr):", manager=ui_manager)
-    rainfall_intensity_slider = pygame_gui.elements.UIHorizontalSlider(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - slider_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 6 - ui_margin), (slider_width, slider_height)), start_value=initial_rainfall_intensity, value_range=(0.0, 200.0), manager=ui_manager, object_id="#rainfall_intensity_slider")
-    # Rainfall Button (Toggle)
-    toggle_rain_button = pygame_gui.elements.UIButton(relative_rect=pygame.Rect((settings.SCREEN_WIDTH - action_button_width - ui_margin, settings.SCREEN_HEIGHT - slider_height * 5 - ui_margin), (action_button_width, button_height)), text='Start Rainfall', manager=ui_manager, object_id="#rain_button")
+    # --- Right column: hazards ---------------------------------------------
+    rx, rw = W - 222, 210
+    y = 10
+    label(rx, y, rw, "— HAZARDS —"); y += 22
+    label(rx, y, rw, "Wind Speed (m/s)"); y += 18
+    s_wind = slider(rx, y, rw, 25, (0, 80)); y += 26
+    b_wind = button(rx, y, rw, "Start Wind"); y += 36
+    label(rx, y, rw, "Earthquake PGA (g)"); y += 18
+    s_pga = slider(rx, y, rw, 0.3, (0.0, 1.0)); y += 26
+    label(rx, y, rw, "Ground Motion"); y += 18
+    d_motion = dropdown(rx, y, rw, MOTIONS, "Synthetic"); y += 30
+    b_quake = button(rx, y, rw, "Trigger Quake"); y += 36
+    label(rx, y, rw, "Rainfall (mm/hr)"); y += 18
+    s_rain = slider(rx, y, rw, 80, (0, 200)); y += 26
+    b_rain = button(rx, y, rw, "Start Rainfall"); y += 30
 
-    # Store sliders for easy access if needed, or use object_ids
-    sliders = {
-        "stories": stories_slider,
-        "story_h": story_h_slider,
-        "length": length_slider,
-        "width": width_slider
-    }
+    # --- Model construction -------------------------------------------------
+    selected_soil = [SOILS["Firm"]]  # the user's chosen soil (liquefaction swaps temporarily)
 
-    # --- Function to create/reset the building ---
-    def create_new_building():
+    def make_building():
         return Building(
-            num_stories=int(stories_slider.get_current_value()),
-            story_height=round(story_h_slider.get_current_value(), 1),
-            footprint_length=round(length_slider.get_current_value(), 1),
-            footprint_width=round(width_slider.get_current_value(), 1),
-            primary_material=CONCRETE, # Or allow selection later
-            rotational_stiffness_nm_per_rad=8e7, # Default, could be UI controlled
-            rotational_damping_nm_s_per_rad=5e6,   # Default, could be UI controlled
-            max_safe_angular_displacement_rad=settings.DEFAULT_MAX_SAFE_ANGLE_RAD
+            num_stories=int(s_stories.get_current_value()),
+            story_height=round(s_story_h.get_current_value(), 2),
+            footprint_length=round(s_length.get_current_value(), 1),
+            footprint_width=round(s_width.get_current_value(), 1),
+            primary_material=MATERIALS[d_material.selected_option[0] if isinstance(d_material.selected_option, tuple) else d_material.selected_option],
+            structural_system=SYSTEMS[d_system.selected_option[0] if isinstance(d_system.selected_option, tuple) else d_system.selected_option],
+            ductility_level=round(s_ductility.get_current_value(), 2),
+            soil_profile=selected_soil[0],
         )
 
-    sample_building = create_new_building()
-    building_base_screen_x_center = settings.SCREEN_WIDTH // 2 # Base position of the building
-    
-    # --- Cloud Management ---
+    building = make_building()
+    base_center_x = W // 2
+
+    # --- Scene props --------------------------------------------------------
     clouds = []
-    MAX_CLOUDS = 7
-    CLOUD_MIN_SPEED = 0.5
-    CLOUD_MAX_SPEED = 1.5
+    for _ in range(6):
+        cw = random.randint(90, 200)
+        ch = random.randint(45, 90)
+        cx = random.randint(0, W)
+        cy = random.randint(20, H // 3)
+        spd = random.uniform(0.3, 1.2) * random.choice([-1, 1])
+        clouds.append(Cloud(cx, cy, cw, ch, spd))
 
-    def create_cloud():
-        width = random.randint(80, 200)
-        height = random.randint(40, 100)
-        # Start off-screen to the right or left
-        x = random.choice([-width, settings.SCREEN_WIDTH]) 
-        y = random.randint(20, settings.SCREEN_HEIGHT // 3) # Clouds in the upper third
-        speed = random.uniform(CLOUD_MIN_SPEED, CLOUD_MAX_SPEED)
-        if x > settings.SCREEN_WIDTH / 2: # If starting on right, move left
-            speed = -speed
-        return Cloud(x, y, width, height, speed)
-
-    for _ in range(MAX_CLOUDS):
-        clouds.append(create_cloud())
-
-    # --- Game State ---
     available_biomes = biome_generator.get_available_biomes()
-    current_biome = random.choice(available_biomes) if available_biomes else "Dfc" # Randomly select, fallback if list is empty
-    game_over_prompt_active = False
-    destruction_animation_playing = False
-    active_fragments = [] # Changed from active_debris
-    destruction_animation_timer = 0.0
-    confirmation_dialog = None
+    current_biome = random.choice(available_biomes) if available_biomes else "Dfc"
 
-    earthquake_active = False
-    earthquake_timer = 0.0
-    earthquake_duration = 3.0 # seconds
-    earthquake_current_intensity_g = 0.0
-    liquefaction_is_active_for_physics = False # For building stiffness reduction
-    liquefaction_threshold_g = 0.3 # PGA in g to trigger liquefaction
-    LIQUEFACTION_SWAY_FREQUENCY_HZ = 0.5 # How fast the ground sways during liquefaction
-    
-    active_wind_particles = []
-    active_rain_particles = []
-    is_raining = False
-    current_rainfall_intensity_mm_hr = 0.0
-    
-    # Flood mechanics
-    current_flood_water_level_m = 0.0  # Meters above a baseline (e.g., average initial ground height)
-    FLOOD_BASELINE_Y_FACTOR = 0.75 # Water level relative to this fraction of screen height
-    flood_drain_rate_m_per_s = 0.0005 # Slow drainage
+    # --- Mutable run state --------------------------------------------------
+    model_dirty = False
+    sim_time = 0.0
+
+    wind_on = False
+    wind_load = [None]
+
+    quake_active = False
+    quake_t = 0.0
+    ground_motion = [None]
+    liquefied = False
+
+    rain_on = False
+    water_level_m = 0.0
+    wind_particles = []
+    rain_particles = []
+
+    # Destruction state
+    destruction_playing = False
+    fragments = []
+    destruction_timer = 0.0
+    dialog = None
+
+    def rebuild():
+        nonlocal building, wind_load, liquefied
+        building = make_building()
+        if wind_on:
+            wind_load[0] = physics.WindLoad(building, s_wind.get_current_value())
+        liquefied = False
+
+    def start_quake():
+        nonlocal quake_active, quake_t, liquefied
+        pga = s_pga.get_current_value()
+        motion = d_motion.selected_option[0] if isinstance(d_motion.selected_option, tuple) else d_motion.selected_option
+        if motion == "Harmonic":
+            ground_motion[0] = physics.HarmonicGroundMotion(pga_g=pga, frequency_hz=1.5, duration=10.0)
+        else:
+            ground_motion[0] = physics.SyntheticGroundMotion(pga_g=pga, duration=18.0, seed=random.randint(0, 9999))
+        quake_active = True
+        quake_t = 0.0
+        # Strong shaking liquefies the chosen soil for the duration of the event.
+        if pga >= 0.4 and not liquefied:
+            building.set_soil_profile(selected_soil[0].with_shear_modulus_factor(0.05))
+            liquefied = True
+
+    def end_quake():
+        nonlocal quake_active, liquefied
+        quake_active = False
+        if liquefied:
+            building.set_soil_profile(selected_soil[0])
+            liquefied = False
+
+    def spawn_wind_particles():
+        wind_particles.clear()
+        speed = s_wind.get_current_value()
+        if speed > 0.1:
+            for _ in range(min(int(speed * 1.5), 150)):
+                wind_particles.append(WindParticle(W, H, speed))
+
+    def spawn_rain_particles():
+        rain_particles.clear()
+        intensity = s_rain.get_current_value()
+        for _ in range(min(int(intensity * 1.5), 320)):
+            x = random.randint(0, W)
+            rain_particles.append(RainParticle(x, H, random.uniform(450, 700), random.uniform(8, 16)))
 
     running = True
     while running:
-        time_delta = clock.tick(settings.FPS) / 1000.0 # time_delta in seconds
-        event_list = pygame.event.get()
-        # --- Event Handling ---
-        for event in event_list:
+        dt = clock.tick(settings.FPS) / 1000.0
+        for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    running = False
-        
-            ui_manager.process_events(event) # Pass events to pygame_gui
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                running = False
 
-            if not game_over_prompt_active and not destruction_animation_playing:
-                # Handle UI events only if not waiting for restart choice
-                if event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
-                    parameter_changed = False
-                    if event.ui_element == stories_slider:
-                        sample_building.num_stories = int(event.value)
-                        parameter_changed = True
-                    elif event.ui_element == story_h_slider:
-                        sample_building.story_height = round(event.value, 1)
-                        parameter_changed = True
-                    elif event.ui_element == length_slider:
-                        sample_building.footprint_length = round(event.value, 1)
-                        parameter_changed = True
-                    elif event.ui_element == width_slider:
-                        sample_building.footprint_width = round(event.value, 1)
-                        parameter_changed = True
-                    
-                    if parameter_changed and not sample_building.is_destroyed:
-                        sample_building.recompute_derived_properties()
+            ui.process_events(event)
 
-                if event.type == pygame_gui.UI_BUTTON_PRESSED:
-                    if event.ui_element == simulate_wind_button and not sample_building.is_destroyed:
-                        wind_speed_mps = wind_speed_slider.get_current_value()
-                        active_wind_particles.clear() # Clear old particles
-                        if wind_speed_mps > 0.1: # Only generate if there's some wind
-                            num_wind_particles = int(wind_speed_mps * 1.5) # More particles for higher speed
-                            for _ in range(min(num_wind_particles, 150)): # Cap max particles
-                                active_wind_particles.append(WindParticle(settings.SCREEN_WIDTH, settings.SCREEN_HEIGHT, wind_speed_mps))
-                        
-                        print(f"Simulating wind at {wind_speed_mps:.1f} m/s")
-                        exposed_area = sample_building.total_height * sample_building.footprint_length 
-                        wind_force_newtons = 0.5 * settings.AIR_DENSITY * (wind_speed_mps**2) * exposed_area * settings.DEFAULT_DRAG_COEFFICIENT
-                        # Assuming wind from left to right, so positive force
-                        sample_building.apply_horizontal_force(wind_force_newtons, sample_building.total_height / 2)
-                    
-                    elif event.ui_element == simulate_earthquake_button and not sample_building.is_destroyed:
-                        if not earthquake_active: # Prevent re-triggering if already active
-                            earthquake_current_intensity_g = earthquake_intensity_slider.get_current_value()
-                            print(f"Simulating earthquake with PGA: {earthquake_current_intensity_g:.2f}g")
-                            earthquake_active = True
-                            earthquake_timer = 0.0
-                            if earthquake_current_intensity_g >= liquefaction_threshold_g:
-                                print("Liquefaction triggered!")
-                                liquefaction_is_active_for_physics = True
-                                sample_building.set_stiffness_reduction_for_liquefaction(True) # Reduce building stiffness
-                        else:
-                            print("Earthquake already in progress.")
-                    
-                    elif event.ui_element == toggle_rain_button and not sample_building.is_destroyed:
-                        is_raining = not is_raining
-                        if is_raining:
-                            toggle_rain_button.set_text("Stop Rainfall")
-                            current_rainfall_intensity_mm_hr = rainfall_intensity_slider.get_current_value()
-                            active_rain_particles.clear()
-                            num_rain_particles = int(current_rainfall_intensity_mm_hr * 0.5) # Density based on intensity
-                            for _ in range(min(num_rain_particles, 300)): # Cap particles
-                                x_pos = random.randint(0, settings.SCREEN_WIDTH)
-                                speed = random.uniform(200, 400) # pixels/sec
-                                length = random.uniform(5, 15)
-                                active_rain_particles.append(RainParticle(x_pos, settings.SCREEN_HEIGHT, speed, length))
-                        else:
-                            toggle_rain_button.set_text("Start Rainfall")
-                            active_rain_particles.clear() # Stop rain particles immediately
+            if event.type == pygame_gui.UI_HORIZONTAL_SLIDER_MOVED:
+                if event.ui_element in (s_stories, s_story_h, s_length, s_width, s_ductility):
+                    model_dirty = True
+                elif event.ui_element is s_wind and wind_on:
+                    wind_load[0] = physics.WindLoad(building, s_wind.get_current_value())
+                    spawn_wind_particles()
 
-            
-            # Handle confirmation dialog events
-            if event.type == pygame_gui.UI_CONFIRMATION_DIALOG_CONFIRMED:
-                if event.ui_element == confirmation_dialog:
-                    print("Restarting simulation...")
-                    sample_building = create_new_building() # Reset building
-                    liquefaction_is_active_for_physics = False # Ensure liquefaction physics off on restart
-                    current_flood_water_level_m = 0.0 # Reset flood
-                    game_over_prompt_active = False
-                    confirmation_dialog = None # Clear the reference
-            
-            if event.type == pygame.USEREVENT: # pygame_gui uses USEREVENT for various things
-                if event.user_type == pygame_gui.UI_WINDOW_CLOSE: # Check if it's our confirmation dialog
-                     if event.ui_element == confirmation_dialog:
-                        print("Exiting after destruction.")
-                        liquefaction_is_active_for_physics = False # Ensure liquefaction physics off on exit
-                        current_flood_water_level_m = 0.0
-                        running = False # Or just keep game_over_prompt_active = True
-                        game_over_prompt_active = False # Allow exit
-                        confirmation_dialog = None
+            elif event.type == pygame_gui.UI_DROP_DOWN_MENU_CHANGED:
+                if event.ui_element is d_soil:
+                    selected_soil[0] = SOILS[event.text]
+                    model_dirty = True
+                elif event.ui_element in (d_material, d_system):
+                    model_dirty = True
 
+            elif event.type == pygame_gui.UI_BUTTON_PRESSED:
+                if event.ui_element is b_wind:
+                    wind_on = not wind_on
+                    b_wind.set_text("Stop Wind" if wind_on else "Start Wind")
+                    if wind_on:
+                        wind_load[0] = physics.WindLoad(building, s_wind.get_current_value())
+                        spawn_wind_particles()
+                    else:
+                        wind_load[0] = None
+                        wind_particles.clear()
+                elif event.ui_element is b_quake and not building.is_destroyed:
+                    start_quake()
+                elif event.ui_element is b_rain:
+                    rain_on = not rain_on
+                    b_rain.set_text("Stop Rainfall" if rain_on else "Start Rainfall")
+                    if rain_on:
+                        spawn_rain_particles()
+                    else:
+                        rain_particles.clear()
 
-        # --- Game Logic Updates (conditionally) ---
-        if not game_over_prompt_active and not destruction_animation_playing:
-            # Update Clouds
-            for cloud in clouds:
-                cloud.rect.x += cloud.speed
-                if cloud.speed > 0 and cloud.rect.left > settings.SCREEN_WIDTH:
-                    cloud.rect.right = 0
-                    cloud.rect.y = random.randint(20, settings.SCREEN_HEIGHT // 3)
-                elif cloud.speed < 0 and cloud.rect.right < 0:
-                    cloud.rect.left = settings.SCREEN_WIDTH
-                    cloud.rect.y = random.randint(20, settings.SCREEN_HEIGHT // 3)
-            
-            # Update Wind Particles
-            for particle in active_wind_particles:
-                particle.update(time_delta)
-            
-            # Update Rain Particles
-            for particle in active_rain_particles:
-                particle.update(time_delta)
-            # Update Building Physics
-            sample_building.update_physics(time_delta)
+            elif event.type == pygame_gui.UI_CONFIRMATION_DIALOG_CONFIRMED and event.ui_element is dialog:
+                # Reset to a fresh building of the current settings.
+                wind_on = False
+                b_wind.set_text("Start Wind")
+                rain_on = False
+                b_rain.set_text("Start Rainfall")
+                water_level_m = 0.0
+                rain_particles.clear()
+                wind_particles.clear()
+                rebuild()
+                dialog = None
 
-            current_liquefaction_effect_scale = 0.0
-            # Apply earthquake forces if active
-            if earthquake_active:
-                earthquake_timer += time_delta
-                if earthquake_timer <= earthquake_duration:
-                    # Simple sinusoidal ground acceleration
-                    # Frequency of shaking (e.g., 2 Hz)
-                    shake_frequency_hz = 2.0
-                    ground_acceleration_mps2 = earthquake_current_intensity_g * 9.81 * math.sin(2 * math.pi * shake_frequency_hz * earthquake_timer)
-                    
-                    # Inertial force acts at CM (approx total_height / 2)
-                    inertial_force = -sample_building.calculated_mass * ground_acceleration_mps2
-                    sample_building.apply_horizontal_force(inertial_force, sample_building.total_height / 2)
+        # Batch geometry rebuilds to once per frame.
+        if model_dirty and not destruction_playing:
+            rebuild()
+            model_dirty = False
 
-                    if liquefaction_is_active_for_physics: # Animate ground only if liquefaction is active
-                        # Scale oscillates between 0 and 1 for the visual effect
-                        current_liquefaction_effect_scale = (math.sin(2 * math.pi * LIQUEFACTION_SWAY_FREQUENCY_HZ * earthquake_timer) + 1.0) / 2.0
-                else:
-                    earthquake_active = False
-                    if liquefaction_is_active_for_physics:
-                        sample_building.set_stiffness_reduction_for_liquefaction(False) # Restore stiffness
-                        liquefaction_is_active_for_physics = False
-                    print("Earthquake finished.")
-            
-            # Update flood level
-            if is_raining and current_rainfall_intensity_mm_hr > 0:
-                # Convert mm/hr to m/s for rise rate
-                # 1 mm/hr = 1/1000 m / 3600 s = 2.77e-7 m/s
-                # Let's use a more impactful arbitrary factor for visual effect for now
-                rise_rate_factor = 0.0001 # Arbitrary factor to make flooding visible faster
-                current_flood_water_level_m += current_rainfall_intensity_mm_hr * rise_rate_factor * time_delta
-            
-            current_flood_water_level_m -= flood_drain_rate_m_per_s * time_delta
-            current_flood_water_level_m = max(0, current_flood_water_level_m)
+        ui.update(dt)
+        sim_time += dt
 
-            # Check for destruction and show prompt
-            if sample_building.is_destroyed and not destruction_animation_playing:
-                print("Building destruction triggered! Starting animation.")
-                destruction_animation_playing = True
-                # Generate fragments using the building's method
-                destruction_animation_timer = 0.0 # Reset timer
-                base_x_m = building_base_screen_x_center / settings.METERS_TO_PIXELS
-                ground_y_pixels_at_base = biome_generator.get_ground_y_at_x(building_base_screen_x_center, current_biome, current_liquefaction_effect_scale) # Use current scale for fragment generation
-                building_base_y_m = ground_y_pixels_at_base / settings.METERS_TO_PIXELS
-                active_fragments = sample_building.generate_fragments(base_x_m, building_base_y_m, sample_building.angular_displacement_rad)
-        
-        if destruction_animation_playing:
-            # Update fragments
-            destruction_animation_timer += time_delta
-            all_settled = True
-            for fragment in active_fragments:
-                fragment.update(time_delta, biome_generator.get_ground_y_at_x, current_biome)
-                if not fragment.is_settled: # Note: fragment.update doesn't currently take liquefaction_effect_scale for its ground check. Could be added.
+        # --- Drive the simulation ------------------------------------------
+        liq_visual = 0.0
+        if not destruction_playing and not building.is_destroyed:
+            ground_accel = 0.0
+            if quake_active:
+                ground_accel = ground_motion[0](quake_t)
+                quake_t += dt
+                if liquefied:
+                    liq_visual = min(1.0, (s_pga.get_current_value() - 0.4) / 0.6 + 0.3)
+                if quake_t > ground_motion[0].duration:
+                    end_quake()
+
+            wind_force = wind_load[0].force_at(sim_time) if (wind_on and wind_load[0] is not None) else None
+
+            if rain_on:
+                water_level_m += (s_rain.get_current_value() / 100.0) * 0.4 * dt
+            else:
+                water_level_m = max(0.0, water_level_m - 0.05 * dt)
+            flood_force = physics.flood_lateral_force(building, water_level_m) if water_level_m > 0.01 else None
+
+            building.update_physics(dt, ground_accel, wind_force, flood_force)
+
+            if building.is_destroyed and not destruction_playing:
+                destruction_playing = True
+                destruction_timer = 0.0
+                base_x_m = base_center_x / settings.METERS_TO_PIXELS
+                ground_y_px = biome_generator.get_ground_y_at_x(base_center_x, current_biome, liq_visual)
+                base_y_m = ground_y_px / settings.METERS_TO_PIXELS
+                fragments = building.generate_fragments(base_x_m, base_y_m, building.angular_displacement_rad)
+
+        # --- Update scene props --------------------------------------------
+        for cloud in clouds:
+            cloud.rect.x += cloud.speed
+            if cloud.speed > 0 and cloud.rect.left > W:
+                cloud.rect.right = 0
+                cloud.rect.y = random.randint(20, H // 3)
+            elif cloud.speed < 0 and cloud.rect.right < 0:
+                cloud.rect.left = W
+                cloud.rect.y = random.randint(20, H // 3)
+        for p in wind_particles:
+            p.update(dt)
+        for p in rain_particles:
+            p.update(dt)
+
+        if destruction_playing:
+            destruction_timer += dt
+            all_settled = bool(fragments)
+            for frag in fragments:
+                frag.update(dt, biome_generator.get_ground_y_at_x, current_biome)
+                if not frag.is_settled:
                     all_settled = False
-            
-            # End animation if all fragments settled OR timer exceeds 5 seconds
-            if (all_settled and active_fragments) or destruction_animation_timer > 5.0:
-                print(f"Destruction animation ended. Reason: {'All settled' if all_settled else 'Timer expired'}.")
-                destruction_animation_playing = False
-                game_over_prompt_active = True 
-                if not confirmation_dialog: # Ensure dialog is not already up
-                    confirmation_dialog = pygame_gui.windows.UIConfirmationDialog(
-                        rect=pygame.Rect((settings.SCREEN_WIDTH // 2 - 150, settings.SCREEN_HEIGHT // 2 - 100), (300, 200)),
-                        manager=ui_manager,
-                        window_title="Building Destroyed!",
-                        action_long_desc="The building has collapsed. Would you like to restart?",
-                        action_short_name="Restart",
-                        blocking=True 
-                    )
+            if (all_settled and fragments) or destruction_timer > 5.0:
+                destruction_playing = False
+                if dialog is None:
+                    dialog = pygame_gui.windows.UIConfirmationDialog(
+                        rect=pygame.Rect((W // 2 - 160, H // 2 - 100), (320, 200)),
+                        manager=ui, window_title="Building Collapsed!",
+                        action_long_desc="The structure has failed. Rebuild and try again?",
+                        action_short_name="Rebuild", blocking=True)
 
-        ui_manager.update(time_delta)
+        # --- Render ---------------------------------------------------------
+        base_ground_y = biome_generator.get_ground_y_at_x(base_center_x, current_biome, liq_visual)
+        flood_surface_y = base_ground_y - water_level_m * settings.METERS_TO_PIXELS
+        renderer.render_world(
+            current_biome, building, base_center_x, clouds=clouds,
+            active_fragments=fragments, destruction_animation_playing=destruction_playing,
+            liquefaction_effect_scale=liq_visual, wind_particles=wind_particles,
+            rain_particles=rain_particles,
+            flood_water_surface_y_px=(flood_surface_y if water_level_m > 0.01 else None))
 
-        # Calculate flood water surface Y in pixels
-        flood_baseline_y_px = settings.SCREEN_HEIGHT * FLOOD_BASELINE_Y_FACTOR
-        flood_water_surface_y_pixels = flood_baseline_y_px - (current_flood_water_level_m * settings.METERS_TO_PIXELS)
-        # --- Rendering ---
-        renderer.render_world(current_biome, sample_building, building_base_screen_x_center, clouds, active_fragments, destruction_animation_playing, liquefaction_effect_scale=current_liquefaction_effect_scale, wind_particles=active_wind_particles, rain_particles=active_rain_particles, flood_water_surface_y_px=flood_water_surface_y_pixels)
-        ui_manager.draw_ui(screen) # Draw pygame_gui elements
-
+        draw_readout(screen, info_font, small_font, building, quake_active, water_level_m, liquefied)
+        ui.draw_ui(screen)
         pygame.display.flip()
 
     pygame.quit()
+
+
+def draw_readout(screen, font, small_font, building, quake_active, water_level_m, liquefied):
+    """Live structural-response readout across the top-centre of the screen."""
+    cap = building.drift_capacity
+    drift = building.max_drift_ratio
+    ratio = drift / cap if cap > 0 else 0.0
+
+    if building.is_destroyed:
+        status, color = "COLLAPSED", (235, 70, 60)
+    elif building.num_failed_stories > 0:
+        status, color = f"{building.num_failed_stories} STORY HINGED", (240, 170, 60)
+    else:
+        status, color = "INTACT", (120, 220, 130)
+
+    if ratio < 0.5:
+        drift_color = (120, 220, 130)
+    elif ratio < 1.0:
+        drift_color = (240, 200, 70)
+    else:
+        drift_color = (235, 70, 60)
+
+    cx = settings.SCREEN_WIDTH // 2
+    line1 = f"T1 = {building.fundamental_period:.2f} s    mass {building.calculated_mass/1e3:,.0f} t"
+    surf1 = font.render(line1, True, (245, 245, 245))
+    screen.blit(surf1, (cx - surf1.get_width() // 2, 12))
+
+    drift_txt = small_font.render(f"max drift {100*drift:.2f}%  (capacity {100*cap:.2f}%)", True, drift_color)
+    screen.blit(drift_txt, (cx - drift_txt.get_width() // 2, 36))
+
+    status_surf = font.render(status, True, color)
+    screen.blit(status_surf, (cx - status_surf.get_width() // 2, 56))
+
+    tags = []
+    if quake_active:
+        tags.append("SHAKING")
+    if liquefied:
+        tags.append("LIQUEFACTION")
+    if water_level_m > 0.01:
+        tags.append(f"FLOOD {water_level_m:.1f} m")
+    if tags:
+        tag_surf = small_font.render("  ".join(tags), True, (200, 220, 255))
+        screen.blit(tag_surf, (cx - tag_surf.get_width() // 2, 80))
+
 
 if __name__ == "__main__":
     main()

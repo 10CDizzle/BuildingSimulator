@@ -15,7 +15,7 @@ CLOUD_COLOR = (240, 248, 255) # AliceBlue, a light, fluffy cloud color
 WINDOW_COLOR = (173, 216, 230) # LightSkyBlue
 
 # --- Simulation Scale ---
-METERS_TO_PIXELS = 10  # 1 meter = 10 pixels
+METERS_TO_PIXELS = 6  # 1 meter = 6 pixels (keeps tall buildings on-screen)
 
 # --- Physics Constants ---
 AIR_DENSITY = 1.225  # kg/m^3 (standard air density at sea level)
