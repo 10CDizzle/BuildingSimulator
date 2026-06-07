@@ -8,6 +8,8 @@ These use the standard-library ``unittest`` so no extra dependency is needed.
 """
 
 import math
+import os
+import tempfile
 import unittest
 
 import numpy as np
@@ -493,6 +495,138 @@ class SoilStructureInteractionTests(unittest.TestCase):
         M, C, K, _ = physics.build_ssi_system(b, physics.MEDIUM_SOIL)
         self.assertTrue(np.all(np.linalg.eigvalsh(M) > 0.0))
         self.assertTrue(np.all(np.linalg.eigvalsh(K) > 0.0))
+
+
+class WindLoadTests(unittest.TestCase):
+    def _building(self, **kw):
+        params = dict(num_stories=10, story_height=3.0, footprint_length=20.0,
+                      footprint_width=15.0, primary_material=CONCRETE)
+        params.update(kw)
+        return Building(**params)
+
+    def test_profile_increases_with_height_and_matches_reference(self):
+        self.assertAlmostEqual(physics.wind_speed_profile(10.0, 30.0, z_ref=10.0), 30.0)
+        speeds = physics.wind_speed_profile(np.array([3.0, 10.0, 30.0]), 30.0)
+        self.assertTrue(np.all(np.diff(speeds) > 0))
+
+    def test_mean_force_grows_up_the_height(self):
+        wind = physics.WindLoad(self._building(), reference_speed=30.0)
+        f = wind.mean_force()
+        self.assertEqual(len(f), 10)
+        self.assertTrue(np.all(np.diff(f) > 0))  # higher floors -> faster wind -> more force
+
+    def test_uniform_profile_matches_hand_calculation(self):
+        b = self._building()
+        wind = physics.WindLoad(b, reference_speed=25.0, exponent=0.0,
+                                drag=1.2, air_density=1.225)
+        area = b.footprint_length * b.story_height
+        expected = 0.5 * 1.225 * 1.2 * 25.0 ** 2 * area
+        np.testing.assert_allclose(wind.mean_force(), expected, rtol=1e-12)
+
+    def test_gust_fluctuates_about_mean(self):
+        wind = physics.WindLoad(self._building(), reference_speed=30.0,
+                                turbulence_intensity=0.2, seed=1)
+        samples = np.array([wind.force_at(t)[-1] for t in np.linspace(0, 60, 600)])
+        mean = wind.mean_force()[-1]
+        self.assertGreater(samples.max(), mean)   # gusts exceed the mean
+        self.assertLess(samples.min(), mean)      # lulls fall below it
+        self.assertTrue(np.all(samples >= 0.0))   # squared factor stays non-negative
+
+
+class GroundMotionTests(unittest.TestCase):
+    def test_harmonic_peaks_at_pga(self):
+        gm = physics.HarmonicGroundMotion(pga_g=0.3, frequency_hz=2.0)
+        samples = np.array([abs(gm(t)) for t in np.linspace(0, 2, 2000)])
+        self.assertAlmostEqual(samples.max(), 0.3 * physics.GRAVITY, delta=1e-3)
+
+    def test_harmonic_respects_finite_duration(self):
+        gm = physics.HarmonicGroundMotion(pga_g=0.3, frequency_hz=2.0, duration=3.0)
+        self.assertEqual(gm(5.0), 0.0)
+
+    def test_synthetic_is_scaled_to_target_pga(self):
+        gm = physics.SyntheticGroundMotion(pga_g=0.4, duration=15.0, seed=7)
+        times, accels = gm.sample(0.005, 15.0)
+        self.assertAlmostEqual(np.max(np.abs(accels)), 0.4 * physics.GRAVITY, delta=1e-2)
+        self.assertEqual(gm(100.0), 0.0)  # zero outside its duration
+
+    def test_recorded_interpolates_and_scales(self):
+        times = np.array([0.0, 1.0, 2.0])
+        accels = np.array([0.0, 2.0, -4.0])
+        gm = physics.RecordedGroundMotion(times, accels)
+        self.assertAlmostEqual(gm(0.5), 1.0)  # linear interpolation
+        scaled = physics.RecordedGroundMotion(times, accels, scale_to_pga_g=0.5)
+        self.assertAlmostEqual(np.max(np.abs([scaled(t) for t in times])),
+                               0.5 * physics.GRAVITY, delta=1e-9)
+
+    def test_recorded_from_two_column_file(self):
+        path = os.path.join(tempfile.gettempdir(), "bs_test_record.txt")
+        np.savetxt(path, np.column_stack([[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]]))
+        try:
+            gm = physics.RecordedGroundMotion.from_file(path)
+            self.assertAlmostEqual(gm(1.5), 1.5)
+        finally:
+            os.remove(path)
+
+
+class FloodLoadTests(unittest.TestCase):
+    def _building(self, **kw):
+        params = dict(num_stories=10, story_height=3.0, footprint_length=20.0,
+                      footprint_width=15.0, primary_material=CONCRETE)
+        params.update(kw)
+        return Building(**params)
+
+    def test_no_force_above_water(self):
+        b = self._building()
+        F = physics.flood_lateral_force(b, water_level=0.0)
+        np.testing.assert_allclose(F, 0.0)
+
+    def test_force_increases_with_water_level(self):
+        b = self._building()
+        low = physics.flood_lateral_force(b, water_level=3.0).sum()
+        high = physics.flood_lateral_force(b, water_level=9.0).sum()
+        self.assertGreater(high, low)
+
+    def test_submerged_story_matches_hydrostatic_resultant(self):
+        b = self._building()
+        # Water exactly at the top of story 1 (height h): the first story is
+        # fully submerged with head h at its base -> resultant rho g width h^2/2.
+        h = b.story_height
+        F = physics.flood_lateral_force(b, water_level=h)
+        expected = 1000.0 * physics.GRAVITY * b.footprint_length * (h ** 2) / 2.0
+        self.assertAlmostEqual(F[0], expected, delta=expected * 1e-9)
+
+    def test_buoyancy_scales_with_submerged_volume(self):
+        b = self._building()
+        up3, vol3 = physics.flood_buoyancy(b, 3.0)
+        up6, vol6 = physics.flood_buoyancy(b, 6.0)
+        self.assertAlmostEqual(up3, 1000.0 * physics.GRAVITY * vol3, places=3)
+        self.assertGreater(up6, up3)
+
+
+class LoadCouplingTests(unittest.TestCase):
+    def test_force_maps_to_ssi_dofs(self):
+        F = np.array([10.0, 20.0, 30.0])
+        z = np.array([3.0, 6.0, 9.0])
+        Q = physics.structural_force_to_ssi(F, z)
+        self.assertEqual(len(Q), 5)
+        np.testing.assert_allclose(Q[:3], F)
+        self.assertAlmostEqual(Q[3], 60.0)            # sum F
+        self.assertAlmostEqual(Q[4], 10 * 3 + 20 * 6 + 30 * 9)  # sum z*F
+
+    def test_static_wind_deflection_matches_direct_solve(self):
+        """End-to-end: integrate the SSI system under steady wind -> K^-1 Q."""
+        b = Building(num_stories=6, story_height=3.0, footprint_length=18.0,
+                     footprint_width=12.0, primary_material=CONCRETE)
+        M, C, K, _ = physics.build_ssi_system(b, physics.MEDIUM_SOIL)
+        wind = physics.WindLoad(b, reference_speed=30.0)
+        Q = physics.structural_force_to_ssi(wind.mean_force(), physics.floor_heights(b))
+
+        dt = physics.modal_analysis(M, K).periods[0] / 60.0
+        integ = physics.NewmarkIntegrator(M, C, K, dt)
+        u = np.zeros(len(Q)); v = np.zeros(len(Q)); a = integ.initial_acceleration(u, v, Q)
+        for _ in range(8000):
+            u, v, a = integ.step(u, v, a, Q)
+        np.testing.assert_allclose(u, np.linalg.solve(K, Q), rtol=1e-3)
 
 
 if __name__ == "__main__":

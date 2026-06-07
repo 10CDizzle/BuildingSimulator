@@ -688,3 +688,243 @@ def build_ssi_system(building, soil):
     k_h, k_r = soil_stiffness(building, soil)
     c_h, c_r = soil_damping(building, soil)
     return assemble_ssi_matrices(M_s, C_s, K_s, m, z, m0, I0, k_h, k_r, c_h, c_r)
+
+
+# ---------------------------------------------------------------------------
+# Load vectors and how they map onto the DOFs
+# ---------------------------------------------------------------------------
+
+def structural_force_to_ssi(force_floor, z):
+    """Generalise a per-floor horizontal load to the SSI DOFs.
+
+    A horizontal force on floor ``i`` does work through that floor's absolute
+    motion ``x_i = u_f + z_i*theta_f + v_i``, so it contributes to the sway and
+    rocking DOFs as well: ``Q = [F_1..F_N, sum F_i, sum z_i F_i]``.
+    """
+    F = np.asarray(force_floor, dtype=float)
+    z = np.asarray(z, dtype=float)
+    return np.concatenate([F, [float(F.sum()), float((z * F).sum())]])
+
+
+def seismic_force(M, influence, ground_acceleration):
+    """Effective earthquake force ``-M @ influence * a_g`` for the given system."""
+    return -np.asarray(M, dtype=float) @ np.asarray(influence, dtype=float) * ground_acceleration
+
+
+# ---------------------------------------------------------------------------
+# Wind load (height-varying mean profile + gusts)
+# ---------------------------------------------------------------------------
+
+class WindLoad:
+    """Per-floor wind force from a power-law boundary-layer profile with gusts.
+
+    The mean wind speed grows with height as ``V(z) = V_ref (z/z_ref)^a`` and the
+    per-floor force is the stagnation pressure on the tributary face area,
+    ``0.5 rho Cd V^2 A``. A turbulent gust component multiplies the mean by
+    ``(1 + I*u(t))^2`` where ``u(t)`` is a zero-mean, unit-variance sum of
+    sinusoids over a turbulence frequency band.
+    """
+
+    def __init__(self, building, reference_speed, z_ref=10.0, exponent=0.16,
+                 drag=1.2, air_density=1.225, turbulence_intensity=0.18,
+                 num_gust_components=16, gust_band_hz=(0.1, 2.0), seed=None):
+        self.z = floor_heights(building)
+        tributary_area = building.footprint_length * building.story_height
+        self.mean_speed = reference_speed * (self.z / z_ref) ** exponent
+        self._mean_force = 0.5 * air_density * drag * self.mean_speed ** 2 * tributary_area
+
+        rng = np.random.default_rng(seed)
+        freqs = np.linspace(gust_band_hz[0], gust_band_hz[1], num_gust_components)
+        self._omega = 2.0 * np.pi * freqs
+        self._phase = rng.uniform(0.0, 2.0 * np.pi, num_gust_components)
+        # Equal-amplitude sinusoids; a = sqrt(2/K) gives unit variance.
+        self._amp = math.sqrt(2.0 / num_gust_components)
+        self.turbulence_intensity = turbulence_intensity
+
+    def mean_force(self):
+        """Per-floor mean (time-averaged steady) wind force vector (N)."""
+        return self._mean_force.copy()
+
+    def _fluctuation(self, t):
+        return self._amp * float(np.sum(np.cos(self._omega * t + self._phase)))
+
+    def force_at(self, t):
+        """Per-floor wind force vector at time ``t`` including gusting (N)."""
+        gust_factor = (1.0 + self.turbulence_intensity * self._fluctuation(t)) ** 2
+        return self._mean_force * gust_factor
+
+
+def wind_speed_profile(z, reference_speed, z_ref=10.0, exponent=0.16):
+    """Power-law mean wind speed at height ``z`` (m/s)."""
+    z = np.asarray(z, dtype=float)
+    return reference_speed * (z / z_ref) ** exponent
+
+
+# ---------------------------------------------------------------------------
+# Ground motion (harmonic, synthetic Kanai-Tajimi, recorded)
+# ---------------------------------------------------------------------------
+
+class GroundMotion:
+    """Base class: a ground-acceleration history, callable as ``a_g(t)`` (m/s^2)."""
+
+    def __call__(self, t):
+        raise NotImplementedError
+
+    def sample(self, dt, duration):
+        """Return ``(times, accelerations)`` sampled at ``dt`` over ``duration``."""
+        times = np.arange(0.0, duration + dt, dt)
+        accels = np.array([self(float(t)) for t in times])
+        return times, accels
+
+
+class HarmonicGroundMotion(GroundMotion):
+    """A pure (optionally finite-duration) sinusoid scaled to a peak PGA in g."""
+
+    def __init__(self, pga_g, frequency_hz, duration=None):
+        self.peak = pga_g * GRAVITY
+        self.omega = 2.0 * math.pi * frequency_hz
+        self.duration = duration
+
+    def __call__(self, t):
+        if self.duration is not None and (t < 0.0 or t > self.duration):
+            return 0.0
+        return self.peak * math.sin(self.omega * t)
+
+
+class SyntheticGroundMotion(GroundMotion):
+    """Stochastic ground motion from the Kanai-Tajimi spectrum.
+
+    White noise is shaped by the Kanai-Tajimi power spectral density (soil filter
+    with predominant frequency ``f_g`` and damping ``zeta_g``) via the spectral
+    representation method, modulated by a build-up / strong / decay envelope, and
+    scaled so the peak acceleration equals the target PGA.
+    """
+
+    def __init__(self, pga_g, duration=20.0, f_g=2.5, zeta_g=0.6,
+                 dt=0.005, num_components=200, seed=None):
+        self.duration = duration
+        omega_g = 2.0 * math.pi * f_g
+        rng = np.random.default_rng(seed)
+
+        omega_max = 2.0 * math.pi * (0.5 / dt)  # Nyquist
+        omega = np.linspace(0.01, omega_max, num_components)
+        d_omega = omega[1] - omega[0]
+
+        # Kanai-Tajimi PSD (S0 = 1; absolute scale fixed later by PGA).
+        num = omega_g ** 4 + (2.0 * zeta_g * omega_g * omega) ** 2
+        den = (omega_g ** 2 - omega ** 2) ** 2 + (2.0 * zeta_g * omega_g * omega) ** 2
+        psd = num / den
+        amp = np.sqrt(2.0 * psd * d_omega)
+        phase = rng.uniform(0.0, 2.0 * math.pi, num_components)
+
+        times = np.arange(0.0, duration + dt, dt)
+        # Spectral representation: sum_k amp_k cos(omega_k t + phase_k).
+        signal = (amp[None, :] * np.cos(np.outer(times, omega) + phase[None, :])).sum(axis=1)
+        signal *= self._envelope(times, duration)
+
+        peak = np.max(np.abs(signal))
+        if peak > 0:
+            signal *= (pga_g * GRAVITY) / peak
+
+        self._times = times
+        self._accels = signal
+
+    @staticmethod
+    def _envelope(t, duration, rise_frac=0.15, decay_frac=0.55):
+        t1 = rise_frac * duration
+        t2 = decay_frac * duration
+        env = np.ones_like(t)
+        rising = t < t1
+        env[rising] = (t[rising] / t1) ** 2
+        decaying = t > t2
+        env[decaying] = np.exp(-(t[decaying] - t2) / (0.25 * duration))
+        return env
+
+    def __call__(self, t):
+        if t < 0.0 or t > self.duration:
+            return 0.0
+        return float(np.interp(t, self._times, self._accels))
+
+
+class RecordedGroundMotion(GroundMotion):
+    """A recorded accelerogram, linearly interpolated and optionally rescaled."""
+
+    def __init__(self, times, accelerations, scale_to_pga_g=None):
+        self._times = np.asarray(times, dtype=float)
+        self._accels = np.asarray(accelerations, dtype=float)
+        if scale_to_pga_g is not None:
+            peak = np.max(np.abs(self._accels))
+            if peak > 0:
+                self._accels = self._accels * (scale_to_pga_g * GRAVITY) / peak
+        self.duration = float(self._times[-1]) if len(self._times) else 0.0
+
+    def __call__(self, t):
+        if t < self._times[0] or t > self._times[-1]:
+            return 0.0
+        return float(np.interp(t, self._times, self._accels))
+
+    @classmethod
+    def from_file(cls, path, dt=None, time_column=0, accel_column=1,
+                  units_g=False, scale_to_pga_g=None):
+        """Load an accelerogram from a whitespace/CSV text file.
+
+        Two-column files are read as ``(time, accel)``; single-column files need
+        an explicit ``dt``. ``units_g=True`` converts a record stored in g to
+        m/s^2.
+        """
+        data = np.loadtxt(path)
+        if data.ndim == 1:
+            if dt is None:
+                raise ValueError("single-column record requires dt")
+            accels = data
+            times = np.arange(len(accels)) * dt
+        else:
+            times = data[:, time_column]
+            accels = data[:, accel_column]
+        if units_g:
+            accels = accels * GRAVITY
+        return cls(times, accels, scale_to_pga_g=scale_to_pga_g)
+
+
+# ---------------------------------------------------------------------------
+# Flood load (hydrostatic surge + buoyancy)
+# ---------------------------------------------------------------------------
+
+def flood_lateral_force(building, water_level, water_density=1000.0):
+    """Per-floor horizontal force from one-sided hydrostatic flood load (N).
+
+    Models a flood/surge acting on the upstream face as a barrier: the pressure
+    ``rho g (h_w - z)`` integrated over each story's submerged strip, lumped to
+    that story's upper floor node. (A uniformly surrounding flood cancels
+    laterally; the destabilising case is the one-sided head modelled here.)
+    """
+    n = building.num_stories
+    h = building.story_height
+    width = building.footprint_length
+    F = np.zeros(n)
+    for i in range(n):
+        z_bottom = i * h
+        z_top = (i + 1) * h
+        submerged_top = min(z_top, water_level)
+        if submerged_top <= z_bottom:
+            continue
+        seg = submerged_top - z_bottom
+        # integral of (water_level - z) dz from z_bottom to submerged_top
+        pressure_integral = (water_level - z_bottom) * seg - 0.5 * seg * seg
+        F[i] = water_density * GRAVITY * width * pressure_integral
+    return F
+
+
+def flood_buoyancy(building, water_level, water_density=1000.0, displacement_fraction=0.9):
+    """Vertical buoyant uplift and submerged volume for the flooded building.
+
+    Returns ``(uplift_N, submerged_volume_m3)``. Uplift reduces the effective
+    gravity load on the foundation (and hence overturning resistance / soil
+    confinement); ``displacement_fraction`` accounts for the building not being
+    a solid block.
+    """
+    submerged_height = max(0.0, min(water_level, building.total_height))
+    volume = (building.footprint_length * building.footprint_width
+              * submerged_height * displacement_fraction)
+    uplift = water_density * GRAVITY * volume
+    return uplift, volume
