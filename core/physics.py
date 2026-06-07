@@ -24,6 +24,7 @@ Newmark-beta integrator, soil-structure interaction, loads, and progressive
 collapse.
 """
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -363,31 +364,33 @@ class ModalResult:
 def modal_analysis(M, K, influence=None):
     """Solve the generalised eigenproblem ``K phi = omega^2 M phi``.
 
-    ``M`` is the (diagonal, positive) mass matrix and ``K`` the stiffness matrix.
-    The problem is reduced to the symmetric standard form
-    ``A = M^-1/2 K M^-1/2`` and solved with ``eigh`` for numerical robustness.
+    Works for any symmetric positive-definite mass matrix (diagonal lumped mass
+    or the consistent, coupled mass matrix of the soil-structure system). The
+    problem is reduced to a symmetric standard form via the Cholesky factor of
+    ``M`` (``M = L L^T``, ``A = L^-1 K L^-T``) and solved with ``eigh``.
     ``influence`` is the rigid-body displacement vector for unit ground motion
     (defaults to all-ones, i.e. uniform horizontal base motion).
     """
     M = np.asarray(M, dtype=float)
     K = np.asarray(K, dtype=float)
-    masses = np.diag(M)
-    inv_sqrt = 1.0 / np.sqrt(masses)
 
-    A = inv_sqrt[:, None] * K * inv_sqrt[None, :]
+    L = np.linalg.cholesky(M)
+    L_inv = np.linalg.inv(L)
+    A = L_inv @ K @ L_inv.T
     A = 0.5 * (A + A.T)  # enforce symmetry before eigh
-    eigvals, psi = np.linalg.eigh(A)
+    eigvals, Y = np.linalg.eigh(A)
 
     eigvals = np.clip(eigvals, 0.0, None)  # guard tiny negative round-off
     order = np.argsort(eigvals)
     eigvals = eigvals[order]
-    psi = psi[:, order]
+    Y = Y[:, order]
 
     omega = np.sqrt(eigvals)
     periods = np.where(omega > 0.0, 2.0 * np.pi / np.maximum(omega, 1e-30), np.inf)
 
-    # Recover mass-normalised mode shapes and fix sign (largest |component| > 0).
-    phi = inv_sqrt[:, None] * psi
+    # Recover mass-normalised mode shapes (Phi^T M Phi = I); fix sign so the
+    # largest-magnitude component is positive for determinism.
+    phi = L_inv.T @ Y
     for j in range(phi.shape[1]):
         if phi[np.argmax(np.abs(phi[:, j])), j] < 0:
             phi[:, j] *= -1.0
@@ -527,3 +530,161 @@ class NewmarkIntegrator:
         a_next = self.c0 * (u_next - u) - self.c2 * v - self.c3 * a
         v_next = v + self.c6 * a + self.c7 * a_next
         return u_next, v_next, a_next
+
+
+# ---------------------------------------------------------------------------
+# Soil-structure interaction (foundation sway + rocking DOFs)
+# ---------------------------------------------------------------------------
+#
+# A fixed-base model assumes the building rises from rigid rock. Real soil
+# deforms: the foundation can translate (sway) and rotate (rock) on the soil,
+# which lengthens the natural period and lets liquefaction / scour show up as a
+# physically meaningful loss of support rather than a tuned stiffness fudge.
+#
+# We append two DOFs -- foundation sway ``u_f`` and rocking ``theta_f`` -- to the
+# N structural DOFs, supported by soil springs and radiation dashpots. Writing
+# the structural DOFs as distortions relative to the (translating, rocking) base
+# keeps the coupled mass, damping, and stiffness matrices symmetric, and the
+# rigid-soil limit cleanly recovers the fixed-base equations.
+
+@dataclass
+class SoilProfile:
+    """Homogeneous half-space soil characterised by its shear-wave velocity."""
+    shear_wave_velocity: float       # V_s (m/s)
+    density: float = 1900.0          # kg/m^3
+    poisson: float = 0.35            # dimensionless
+
+    @property
+    def shear_modulus(self):
+        """G = rho * V_s^2 (Pa)."""
+        return self.density * self.shear_wave_velocity ** 2
+
+    def with_shear_modulus_factor(self, factor):
+        """A softened copy with the shear modulus scaled by ``factor``.
+
+        Used to model liquefaction / scour: ``G`` scales with ``V_s^2``, so the
+        velocity is scaled by ``sqrt(factor)``.
+        """
+        return SoilProfile(self.shear_wave_velocity * math.sqrt(factor),
+                           self.density, self.poisson)
+
+
+# Representative profiles (V_s bands roughly per site-class usage).
+ROCK_SOIL = SoilProfile(shear_wave_velocity=1200.0)
+FIRM_SOIL = SoilProfile(shear_wave_velocity=400.0)
+MEDIUM_SOIL = SoilProfile(shear_wave_velocity=250.0)
+SOFT_SOIL = SoilProfile(shear_wave_velocity=150.0)
+
+
+def floor_heights(building):
+    """Heights of each floor above the base (m), length ``N``."""
+    return np.arange(1, building.num_stories + 1) * building.story_height
+
+
+def foundation_radii(building):
+    """Equivalent circular foundation radii ``(sway, rocking)`` (m).
+
+    The footprint is matched to an equivalent disc by area for sway and by
+    second moment of area for rocking (bending about the width axis, since the
+    building is loaded along its length).
+    """
+    L = building.footprint_length
+    W = building.footprint_width
+    area = L * W
+    r_sway = math.sqrt(area / math.pi)
+    second_moment = W * L ** 3 / 12.0
+    r_rock = (4.0 * second_moment / math.pi) ** 0.25
+    return r_sway, r_rock
+
+
+def soil_stiffness(building, soil):
+    """Static soil sway and rocking stiffness ``(k_h, k_r)`` (Gazetas/halfspace)."""
+    G = soil.shear_modulus
+    nu = soil.poisson
+    r_h, r_r = foundation_radii(building)
+    k_h = 8.0 * G * r_h / (2.0 - nu)
+    k_r = 8.0 * G * r_r ** 3 / (3.0 * (1.0 - nu))
+    return k_h, k_r
+
+
+def soil_damping(building, soil):
+    """Soil radiation dashpots ``(c_h, c_r)`` for sway and rocking (cone model)."""
+    rho = soil.density
+    vs = soil.shear_wave_velocity
+    nu = soil.poisson
+    L = building.footprint_length
+    W = building.footprint_width
+    area = L * W
+    second_moment = W * L ** 3 / 12.0
+    v_la = 3.4 * vs / (math.pi * (1.0 - nu))  # Lysmer's analog velocity
+    c_h = rho * vs * area
+    c_r = rho * v_la * second_moment
+    return c_h, c_r
+
+
+def foundation_mass(building, mat_density=2400.0, thickness=1.0):
+    """Foundation mat mass and rocking inertia ``(m0, I0)``."""
+    L = building.footprint_length
+    W = building.footprint_width
+    m0 = L * W * thickness * mat_density
+    I0 = m0 * (L ** 2) / 12.0
+    return m0, I0
+
+
+def assemble_ssi_matrices(M_s, C_s, K_s, floor_mass, z, m0, I0, k_h, k_r, c_h, c_r):
+    """Assemble the coupled (N+2)-DOF soil-structure system.
+
+    DOF order is ``[v_1..v_N, u_f, theta_f]`` where ``v_i`` are floor distortions
+    relative to the base, ``u_f`` is foundation sway and ``theta_f`` rocking.
+    Returns ``(M, C, K, influence)``; the seismic load is ``-M @ influence * a_g``
+    with ``influence`` a unit in the sway DOF.
+    """
+    m = np.asarray(floor_mass, dtype=float)
+    z = np.asarray(z, dtype=float)
+    n = len(m)
+    mz = m * z
+    m_total = float(m.sum()) + m0
+    first_moment = float((m * z).sum())
+    second_moment = float((m * z * z).sum()) + I0
+
+    size = n + 2
+    M = np.zeros((size, size))
+    C = np.zeros((size, size))
+    K = np.zeros((size, size))
+
+    M[:n, :n] = M_s
+    M[:n, n] = m
+    M[n, :n] = m
+    M[:n, n + 1] = mz
+    M[n + 1, :n] = mz
+    M[n, n] = m_total
+    M[n, n + 1] = first_moment
+    M[n + 1, n] = first_moment
+    M[n + 1, n + 1] = second_moment
+
+    K[:n, :n] = K_s
+    K[n, n] = k_h
+    K[n + 1, n + 1] = k_r
+
+    C[:n, :n] = C_s
+    C[n, n] = c_h
+    C[n + 1, n + 1] = c_r
+
+    influence = np.zeros(size)
+    influence[n] = 1.0  # unit ground motion = unit foundation sway
+    return M, C, K, influence
+
+
+def build_ssi_system(building, soil):
+    """Convenience: full SSI ``(M, C, K, influence)`` for a building on soil."""
+    M_s = assemble_mass_matrix(floor_masses(building))
+    K_s = structural_stiffness_matrix(building)
+    modal = modal_analysis(M_s, K_s)
+    C_s = damping_matrix(building, M_s, K_s, modal)
+
+    m = floor_masses(building)
+    z = floor_heights(building)
+    m0, I0 = foundation_mass(building)
+    k_h, k_r = soil_stiffness(building, soil)
+    c_h, c_r = soil_damping(building, soil)
+    return assemble_ssi_matrices(M_s, C_s, K_s, m, z, m0, I0, k_h, k_r, c_h, c_r)

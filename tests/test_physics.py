@@ -415,5 +415,85 @@ class NewmarkIntegratorTests(unittest.TestCase):
         self.assertGreater(peak_on, 5 * peak_off)
 
 
+class SoilStructureInteractionTests(unittest.TestCase):
+    def _building(self, **kw):
+        params = dict(num_stories=10, story_height=3.0, footprint_length=20.0,
+                      footprint_width=15.0, primary_material=CONCRETE)
+        params.update(kw)
+        return Building(**params)
+
+    def _fixed_base_period(self, b):
+        M = physics.assemble_mass_matrix(physics.floor_masses(b))
+        K = physics.structural_stiffness_matrix(b)
+        return physics.modal_analysis(M, K).periods[0]
+
+    def _ssi_period(self, b, soil):
+        M, C, K, _ = physics.build_ssi_system(b, soil)
+        return physics.modal_analysis(M, K).periods[0]
+
+    def test_matrices_are_symmetric(self):
+        b = self._building()
+        M, C, K, _ = physics.build_ssi_system(b, physics.MEDIUM_SOIL)
+        for name, A in (("M", M), ("C", C), ("K", K)):
+            np.testing.assert_allclose(A, A.T, rtol=0, atol=abs(A).max() * 1e-9,
+                                       err_msg=f"{name} not symmetric")
+
+    def test_influence_picks_out_translational_mass(self):
+        b = self._building()
+        M, C, K, influence = physics.build_ssi_system(b, physics.MEDIUM_SOIL)
+        n = b.num_stories
+        m = physics.floor_masses(b)
+        z = physics.floor_heights(b)
+        m0, _I0 = physics.foundation_mass(b)
+        load = M @ influence  # = [m ; m_total ; first_moment]
+        np.testing.assert_allclose(load[:n], m, rtol=1e-12)
+        self.assertAlmostEqual(load[n], float(m.sum()) + m0, places=3)
+        self.assertAlmostEqual(load[n + 1], float((m * z).sum()), places=3)
+
+    def test_rigid_soil_recovers_fixed_base(self):
+        """As the soil stiffens, the first SSI period -> the fixed-base period."""
+        b = self._building()
+        rigid = physics.SoilProfile(shear_wave_velocity=40000.0)  # ~rigid rock
+        self.assertAlmostEqual(self._ssi_period(b, rigid), self._fixed_base_period(b),
+                               delta=self._fixed_base_period(b) * 0.02)
+
+    def test_soft_soil_lengthens_period(self):
+        b = self._building()
+        fixed = self._fixed_base_period(b)
+        self.assertGreater(self._ssi_period(b, physics.SOFT_SOIL), fixed)
+
+    def test_softer_soil_lengthens_period_more(self):
+        b = self._building()
+        firm = self._ssi_period(b, physics.FIRM_SOIL)
+        soft = self._ssi_period(b, physics.SOFT_SOIL)
+        self.assertGreater(soft, firm)
+
+    def test_liquefaction_strongly_lengthens_period(self):
+        """Near-total loss of soil stiffness must noticeably lengthen the period.
+
+        The increase is bounded by the (structure-dominated) fixed-base period --
+        SSI contributions add in quadrature -- so a ~25%+ jump is the expected
+        signature for a stiff structure, not an unbounded one.
+        """
+        b = self._building()
+        firm = self._ssi_period(b, physics.FIRM_SOIL)
+        liquefied = self._ssi_period(b, physics.FIRM_SOIL.with_shear_modulus_factor(0.02))
+        self.assertGreater(liquefied, 1.25 * firm)
+
+    def test_softer_soil_increases_compliance(self):
+        """Soil springs must drop when the shear modulus drops."""
+        b = self._building()
+        kh_firm, kr_firm = physics.soil_stiffness(b, physics.FIRM_SOIL)
+        kh_soft, kr_soft = physics.soil_stiffness(b, physics.SOFT_SOIL)
+        self.assertLess(kh_soft, kh_firm)
+        self.assertLess(kr_soft, kr_firm)
+
+    def test_ssi_system_is_positive_definite(self):
+        b = self._building()
+        M, C, K, _ = physics.build_ssi_system(b, physics.MEDIUM_SOIL)
+        self.assertTrue(np.all(np.linalg.eigvalsh(M) > 0.0))
+        self.assertTrue(np.all(np.linalg.eigvalsh(K) > 0.0))
+
+
 if __name__ == "__main__":
     unittest.main()

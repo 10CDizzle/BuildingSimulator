@@ -2,6 +2,7 @@ import pygame
 from pygame import gfxdraw
 import random
 import math
+import numpy as np
 from config import settings  # For METERS_TO_PIXELS and colors
 
 
@@ -26,16 +27,25 @@ def scale_color(color, factor):
 def vertical_gradient(width, height, top_color, bottom_color, alpha=255):
     """A ``width`` x ``height`` surface shaded top-to-bottom.
 
-    Built by colouring a 1-pixel-wide column and scaling it horizontally, which
-    is far cheaper than per-pixel fills.
+    The gradient is built as a 1-pixel-wide column with numpy (vectorised, no
+    per-pixel Python loop) and scaled horizontally, which is cheap enough to run
+    every frame.
     """
     height = max(1, int(height))
     width = max(1, int(width))
+
+    ts = np.linspace(0.0, 1.0, height)
+    top = np.array(top_color[:3], dtype=float)
+    bottom = np.array(bottom_color[:3], dtype=float)
+
     column = pygame.Surface((1, height), pygame.SRCALPHA)
-    for y in range(height):
-        t = y / max(1, height - 1)
-        r, g, b = lerp_color(top_color, bottom_color, t)
-        column.set_at((0, y), (r, g, b, alpha))
+    rgb = pygame.surfarray.pixels3d(column)      # shape (1, height, 3)
+    a = pygame.surfarray.pixels_alpha(column)    # shape (1, height)
+    for c in range(3):
+        rgb[0, :, c] = (top[c] * (1.0 - ts) + bottom[c] * ts).astype(np.uint8)
+    a[0, :] = alpha
+    del rgb, a  # release the surface locks before scaling
+
     return pygame.transform.smoothscale(column, (width, height))
 
 
